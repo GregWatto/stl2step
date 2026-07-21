@@ -6,7 +6,9 @@ __pycache__/
 
 # Editor / OS
 .DS_Store
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*/*.local.*
 
 # Generated output (STEP files, reports, colormaps go to /tmp by default)
 /out/

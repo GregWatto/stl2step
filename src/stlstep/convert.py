@@ -26,6 +26,9 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
             segmenter: str = "rg",
             report_dir: str | None = None,
             p95_threshold_mm: float = 0.1,
+            llm_model: str = "claude-opus-4-8",
+            llm_iters: int = 4,
+            composer=None,
             detector_kwargs: dict | None = None) -> dict:
     t0 = time.time()
     ing = load_and_repair(stl_path)
@@ -42,6 +45,26 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
                     "note": "not a single-feature (extrude/revolve) part",
                     "elapsed_s": round(time.time() - t0, 2)}
         method = "solid"   # auto: fall back to the BREP path
+
+    # 'llm': the LLM composes the build123d feature script; execute + verify +
+    # refine until it meets tolerance, then export the best candidate.
+    if method == "llm":
+        from . import compose as co
+        workdir = report_dir or os.path.join(
+            os.path.dirname(os.path.abspath(step_path)) or ".", "_llm_work")
+        if composer is None:
+            try:
+                composer = co.AnthropicComposer(model=llm_model)
+            except Exception as e:  # noqa: BLE001 — missing SDK/key is a soft fail
+                return {"input": stl_path, "output": step_path, "method": "llm",
+                        "drawn": False,
+                        "note": (f"LLM composer unavailable: {e}. Install the "
+                                 "'anthropic' SDK and set ANTHROPIC_API_KEY, or "
+                                 "pass a composer."),
+                        "elapsed_s": round(time.time() - t0, 2)}
+        res = co.compose_loop(ing.mesh, composer, workdir,
+                              max_iters=llm_iters, dev_tol=p95_threshold_mm)
+        return _finish_compose(res, ing, stl_path, step_path, workdir, t0)
 
     if segmenter == "rg":
         seg = segment_rg(ing.mesh, ing.neighbors)
@@ -121,6 +144,40 @@ def _finish_draw(res, ing, stl_path, step_path, report_dir, t0) -> dict:
     return result
 
 
+def _finish_compose(res, ing, stl_path, step_path, workdir, t0) -> dict:
+    """Export an LLM-composed result: STEP + feature-tree script + report."""
+    from build123d import export_step
+    best = res.best
+    if best is None or not best.ok:
+        return {"input": stl_path, "output": step_path, "method": "llm",
+                "drawn": False, "attempts": len(res.attempts),
+                "note": "the LLM did not produce a buildable part",
+                "elapsed_s": round(time.time() - t0, 2)}
+    os.makedirs(os.path.dirname(os.path.abspath(step_path)), exist_ok=True)
+    export_step(best.part, step_path)
+    os.makedirs(workdir, exist_ok=True)
+    with open(os.path.join(workdir, "feature_tree.py"), "w") as fp:
+        fp.write(best.script)
+
+    mesh_vol = float(ing.mesh.volume) if ing.mesh.is_watertight else None
+    result = {
+        "input": stl_path, "output": step_path, "method": "llm",
+        "drawn": True, "passed": bool(res.passed), "attempts": len(res.attempts),
+        "elapsed_s": round(time.time() - t0, 2),
+        "deviation_p99_mm": round(best.deviation_mm, 4),
+        "reverse_p99_mm": round(best.reverse_max_mm, 4),
+        "volume_mm3": round(best.volume_mm3, 3),
+        "mesh_volume_mm3": (round(mesh_vol, 3) if mesh_vol else None),
+        "brep_face_count": best.metrics.get("brep_faces"),
+        "valid": best.valid, "closed": best.closed,
+        "colormap": best.colormap_png,
+    }
+    with open(os.path.join(workdir, "report.json"), "w") as fp:
+        json.dump(result, fp, indent=2, default=str)
+    result["feature_script"] = best.script
+    return result
+
+
 def _is_solid(shape) -> bool:
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_SOLID
@@ -143,8 +200,10 @@ def main(argv=None) -> int:
     p.add_argument("stl_path")
     p.add_argument("-o", "--output", required=True, help="output .step path")
     p.add_argument("--method", default="auto",
-                   choices=["auto", "draw", "facets", "merged", "shell", "solid"],
-                   help="auto = draw a feature model, else BREP solid (default)")
+                   choices=["auto", "draw", "llm", "facets", "merged", "shell",
+                            "solid"],
+                   help="auto = draw a feature model, else BREP solid (default); "
+                        "llm = LLM composes the feature script")
     p.add_argument("--segmenter", default="rg", choices=["rg", "ransac"],
                    help="rg = region-growing (default), ransac = old detector")
     p.add_argument("--report", default=None, help="report dir (JSON + PNG)")
@@ -152,15 +211,34 @@ def main(argv=None) -> int:
                    help="per-region p95 deviation limit (mm)")
     p.add_argument("--samples", type=int, default=10000,
                    help="detector sample count")
+    p.add_argument("--llm-model", default="claude-opus-4-8",
+                   help="model for --method llm")
+    p.add_argument("--llm-iters", type=int, default=4,
+                   help="max refine iterations for --method llm")
     args = p.parse_args(argv)
 
     result = convert(
         args.stl_path, args.output, method=args.method,
         segmenter=args.segmenter,
         report_dir=args.report, p95_threshold_mm=args.threshold,
+        llm_model=args.llm_model, llm_iters=args.llm_iters,
         detector_kwargs={"n_samples": args.samples},
     )
     name = os.path.basename(args.stl_path)
+
+    if result.get("method") == "llm":
+        if not result.get("drawn"):
+            print(f"[{name}] llm draw failed: {result['note']}")
+            return 1
+        print(f"[{name}] llm ({result['attempts']} iter) {result['elapsed_s']}s")
+        print(f"  faces={result['brep_face_count']}  valid={result['valid']} "
+              f"closed={result['closed']}")
+        print(f"  deviation p99={result['deviation_p99_mm']}mm  "
+              f"reverse p99={result['reverse_p99_mm']}mm  "
+              f"volume {result['volume_mm3']} vs mesh {result['mesh_volume_mm3']}")
+        print(f"  RESULT: {'PASS' if result['passed'] else 'FAIL'}  "
+              f"(feature_tree.py + report written)")
+        return 0 if result["passed"] else 1
 
     if result.get("drawn"):                      # parametric feature model
         print(f"[{name}] {result['method']} {result['elapsed_s']}s")

@@ -5,11 +5,29 @@
 - BREP pipeline: region-growing segmentation → analytic surfaces (plane/cylinder/
   cone/sphere/torus) + NURBS drape + clean intersection-curve edges → guarded
   watertight solid. Honest per-region gate.
-- Draw path: **extrusion** and **revolve** recognizers → build123d feature-tree
-  scripts, with accurate line/arc/circle fitting + verify-and-fallback.
+- Draw path: **extrusion**, **revolve**, and **prismatic-stack (2.5D)**
+  recognizers → build123d feature-tree scripts, with accurate line/arc/circle
+  fitting + verify-and-fallback.
 - `auto` dispatcher (default): draw if possible, else BREP `solid`.
+- **LLM composition path** (`compose.py`): `analyze` → dimensioned feature report,
+  `render_views`, `run_candidate` (exec+verify+two colormaps), `compose_loop`
+  (generate→verify→refine). Driven keyless by the **`stl-draw` skill** (Claude is
+  the composer, like img2threejs) or headless by `AnthropicComposer`
+  (`--method llm`). Proven on `crossblock` (cross-axis hole, 0.02mm, first pass);
+  the refine loop catches a dropped feature (9mm + wrong volume).
 
-## Next: the LLM-composed multi-feature path (the main event)
+## Next: extend the composition path
+
+Remaining to make the LLM path cover the hardest real parts:
+- **Fillet/chamfer support**: detect fillet edges in `analyze` (they currently
+  read as freeform/torus regions) and prompt the composer to add `fillet`/
+  `chamfer`. Verify radii via the colormap loop.
+- **Live refine runs**: drive the `stl-draw` skill on `battery_cover`/`diff_case`
+  to turn the last BREP-fallback parts into feature trees (or confirm freeform).
+- **Headless smoke**: run `--method llm` once with a real key to exercise the
+  multi-turn `AnthropicComposer` end-to-end.
+
+## Original plan: the LLM-composed multi-feature path (now largely built above)
 
 **Why**: parts that are `base + holes + pockets + bosses + fillets` (most real
 mechanical parts) are neither a single extrusion nor a single revolve, so today

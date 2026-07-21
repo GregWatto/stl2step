@@ -33,21 +33,38 @@ uniquely good at. Transferred here as:
 
 ## The architecture (two strategies + a dispatcher)
 
-**A. Draw it (parametric feature model)** — `src/stlstep/draw.py`. Recognize how
+**A. Draw it (deterministic recognizers)** — `src/stlstep/draw.py`. Recognize how
 the part was built and re-draw it with build123d feature ops, so topology is
 correct by construction and the output is an editable **feature-tree script**.
 - `detect_extrusion` → constant cross-section along an axis → sketch + `extrude`
 - `detect_revolve` → rotational symmetry → (radial, axial) profile + `revolve`
+- `detect_prismatic` → 2.5D stack (base + boss + blind pocket + step + through
+  holes): slab-decompose along an axis at cross-section breakpoints, rebuild as a
+  UNION of per-slab extrudes (union reproduces bosses/pockets/holes for free)
 - profile fitting: `fit_loop` → clean lines / arcs / circles
-- `draw(mesh)` dispatcher: try each recognizer, verify, return best or None
+- `draw(mesh)` dispatcher: Tier 1 single-feature (extrude/revolve), Tier 2
+  prismatic; build + verify each, return best passing or None
+
+**C. LLM draws it (composition)** — `src/stlstep/compose.py`. The img2threejs loop
+for parts that aren't any single recognizer (cross-axis holes, fillets, unusual
+compositions). `analyze(mesh)` → a dimensioned feature report; `render_views` →
+shaded multiview PNG; the LLM **composes** a build123d script; `run_candidate`
+executes + verifies + renders two deviation colormaps (missing / extra);
+`compose_loop` iterates generate→verify→refine. The LLM never emits geometry —
+it plans CAD ops; the kernel executes; the gate verifies. Composers are pluggable:
+the **`stl-draw` skill** (`.claude/skills/stl-draw/`) runs it with Claude
+in-session as the composer (no API key); `AnthropicComposer` is the headless API
+backend (`convert --method llm`).
 
 **B. BREP fallback** — for parts that are NOT a single extrude/revolve. Pipeline:
 `ingest → segment_rg → surfaces/edges/nurbs → topology → verify`. Produces a
 watertight solid with analytic surfaces and clean intersection-curve edges.
 Region-by-region fallback (clean → polyline merge → NURBS drape → facet), guarded.
 
-**Dispatcher** — `convert.py` `method="auto"` (default): draw a feature model;
-if the part isn't drawable, fall back to the `solid` BREP method.
+**Dispatcher** — `convert.py` `method="auto"` (default): draw a feature model
+(A); if the part isn't drawable, fall back to the `solid` BREP method (B). The
+LLM path (C) is opt-in via the `stl-draw` skill or `--method llm` (avoids
+surprise API cost in `auto`).
 
 ## Current state (all committed, latest 31464a3)
 
@@ -59,6 +76,8 @@ Working end-to-end via one CLI. Per-fixture results:
 | shaft | draw:revolve | 0.002mm | synthetic stepped shaft |
 | sleeve | draw:revolve | 0.04mm | ring/washer |
 | bearing | draw:revolve | 0.08mm | races become arcs in the profile |
+| bracket | draw:prismatic | 0.04mm | plate + boss + blind pocket + 4 holes, 25 faces, 3 levels |
+| crossblock | llm (skill) | 0.02mm | block + boss + cross-axis hole + corner holes, 13 faces |
 | battery_cover | BREP solid | exact | curved cover body → BREP fallback |
 | diff_case | BREP solid | exact | complex multi-feature → BREP fallback |
 
@@ -107,10 +126,24 @@ trust `occ_util.shape_to_mesh` for watertightness (it tessellates per-face).
 - Generated output (STEP/reports) goes to /tmp or the user's ~/Downloads for
   review in Fusion; root-level `*.step` / `*_report/` are gitignored.
 
+## Key modules (added)
+
+- `compose.py` — the LLM composition path: `analyze` (dimensioned feature
+  report), `render_views`, `build_brief`, `run_candidate` (exec+verify+colormaps),
+  `compose_loop`, and composers (`AnthropicComposer`, `FileComposer`). CLI:
+  `python -m stlstep.compose {brief,run}` — the steps the `stl-draw` skill drives.
+- `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill.
+
 ## Next step
 
-The **LLM-composed multi-feature path** — see `roadmap.md`. For parts that are
-base + holes + pockets + bosses + fillets (most real mechanical parts), the LLM
-composes the build123d operations, guided by the analysis, verified by the gate.
-That turns the BREP-fallback parts (battery_cover, diff_case) into clean feature
-trees. This is the main event remaining.
+The composition path (C) works end-to-end: the `stl-draw` skill has Claude draw a
+part from the analysis + views, verify, and refine — proven on `crossblock`
+(cross-axis hole, 0.02mm, first pass) and the refine loop catches a dropped
+feature (9mm + wrong volume). Remaining polish:
+- **Fillets/chamfers** in the composer prompt + a fillet-edge detector in
+  `analyze` (currently fillets read as freeform/torus regions).
+- **Run the real refine loop live** on `battery_cover`/`diff_case` via the skill
+  (turn the last BREP-fallback parts into feature trees, or confirm freeform).
+- **Consider** an `auto` tier that invokes the skill/LLM before BREP (kept opt-in
+  for now to avoid surprise API cost; the skill is the keyless entry point).
+- Headless `--method llm` is wired but untested live (needs `anthropic` + key).
