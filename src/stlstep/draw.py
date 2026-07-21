@@ -93,11 +93,13 @@ class Seg:
     mid: tuple = None         # arc: a point on the arc between p0 and p1
 
 
-def fit_loop(pts, *, corner_deg=18.0, arc_min_pts=4, line_tol=0.02,
-             arc_resid_frac=0.12):
+def fit_loop(pts, *, arcs=True, corner_deg=18.0, arc_min_pts=4, line_tol=0.02,
+             arc_resid_frac=0.06):
     """Fit a closed polyline into clean line/arc segments. A loop with no sharp
     corners that fits a circle is a full circle; otherwise split at corners and
-    classify each run between corners as a line or a circular arc."""
+    classify each run between corners as line(s) or a circular arc. With
+    `arcs=False`, curved runs are kept as an exact polyline instead (the safe
+    fallback the caller verifies against)."""
     P = np.asarray(pts, dtype=float)
     if np.allclose(P[0], P[-1]):
         P = P[:-1]
@@ -121,29 +123,68 @@ def fit_loop(pts, *, corner_deg=18.0, arc_min_pts=4, line_tol=0.02,
     segs = []
     for a, b in zip(corners, corners[1:] + [corners[0] + n]):
         idx = [i % n for i in range(a, b + 1)]
-        segs.extend(_fit_run(P[idx], arc_min_pts, line_tol, arc_resid_frac))
+        segs.extend(_curvature_fit(P[idx], arc_min_pts, line_tol,
+                                   arc_resid_frac, arcs))
     return segs
 
 
-def _fit_run(run, arc_min_pts, line_tol, arc_resid_frac):
-    """Classify one inter-corner run as a single line, a single arc, or (when
-    neither cleanly fits) an exact polyline — so a channel/mouth that isn't a
-    clean arc stays dimensionally exact instead of being forced into a bad arc."""
-    p0, p1 = tuple(run[0]), tuple(run[-1])
-    chord = float(np.linalg.norm(run[-1] - run[0]))
-    sag = _max_sagitta(run)
-    if len(run) < arc_min_pts or sag < line_tol * max(chord, 1.0):
-        return [Seg("line", p0, p1)]
-    fit = _circle_fit_2d(run)
-    if fit is not None:
-        cx, cy, r, resid = fit
-        # a real arc: endpoints lie on the circle (chord <= diameter), tight fit
-        if chord < 1.98 * r and resid < arc_resid_frac * r and r < 1e4:
-            return [Seg("arc", p0, p1, center=(cx, cy), radius=r,
-                        mid=tuple(run[len(run) // 2]))]
-    # neither a clean line nor a clean arc -> exact polyline (no corner-cutting)
-    return [Seg("line", tuple(run[k]), tuple(run[k + 1]))
-            for k in range(len(run) - 1)]
+def _polyline_segs(pts):
+    return [Seg("line", tuple(pts[k]), tuple(pts[k + 1]))
+            for k in range(len(pts) - 1)]
+
+
+def _curvature_fit(run, arc_min_pts, line_tol, arc_resid_frac, arcs,
+                   curve_deg=4.0):
+    """Split an inter-corner run into lines and arcs by turning rate. A straight
+    edge turns ~0 per vertex; a smooth arc turns by a small, consistent amount.
+    Group consecutive edges as curved vs straight (rather than greedily growing a
+    circle, which lets an arc swallow a tangent straight edge), then fit an arc
+    to each curved group and a line to each straight group."""
+    run = np.asarray(run, dtype=float)
+    m = len(run)
+    if m < 3:
+        return [Seg("line", tuple(run[0]), tuple(run[-1]))]
+    d = run[1:] - run[:-1]
+    ang = np.arctan2(d[:, 1], d[:, 0])
+    turn = np.abs(_wrap(np.diff(ang)))                 # turning at vertices 1..m-2
+    curved_v = turn >= np.radians(curve_deg)           # per interior vertex
+    # an edge is curved if either of its endpoints turns
+    edge_curved = np.zeros(m - 1, dtype=bool)
+    for k in range(m - 1):
+        left = curved_v[k - 1] if k - 1 >= 0 and k - 1 < len(curved_v) else False
+        right = curved_v[k] if k < len(curved_v) else False
+        edge_curved[k] = bool(left or right)
+
+    segs = []
+    i = 0
+    while i < m - 1:
+        j = i
+        while j + 1 < m - 1 and edge_curved[j + 1] == edge_curved[i]:
+            j += 1
+        grp = run[i:j + 2]                             # points of edges i..j
+        if edge_curved[i] and len(grp) >= arc_min_pts:
+            seg = _fit_arc_group(grp, line_tol, arc_resid_frac) if arcs else None
+            # curved run: an arc if one fits (and arcs enabled), else keep the
+            # exact polyline so it stays dimensionally accurate
+            segs.extend([seg] if seg else _polyline_segs(grp))
+        else:
+            segs.append(Seg("line", tuple(grp[0]), tuple(grp[-1])))
+        i = j + 1
+    return segs
+
+
+def _fit_arc_group(grp, line_tol, arc_resid_frac):
+    fit = _circle_fit_2d(grp)
+    if fit is None:
+        return None
+    cx, cy, r, resid = fit
+    chord = float(np.linalg.norm(grp[-1] - grp[0]))
+    sag = _max_sagitta(grp)
+    if r < 1e4 and chord < 2.02 * r and resid < arc_resid_frac * r \
+            and sag > line_tol * chord:
+        return Seg("arc", tuple(grp[0]), tuple(grp[-1]), center=(cx, cy),
+                   radius=r, mid=tuple(grp[len(grp) // 2]))
+    return None
 
 
 def _spans_circle(P, cfit):
@@ -160,18 +201,49 @@ def _spans_circle(P, cfit):
 _PLANE = {0: "YZ", 1: "XZ", 2: "XY"}
 
 
-def draw_extrusion(ext: Extrusion):
+def draw_extrusion(ext: Extrusion, mesh=None, *, dev_tol=0.1):
     """Build the parametric solid and the feature-tree script for an extrusion.
-    Returns (build123d_part, script_text, fit_summary)."""
-    loops = [fit_loop(lp) for lp in ext.loops]
+
+    Fits the profile with arcs, then — if a mesh is given — verifies the result
+    against it and, if arcs made it worse than the tolerance, refits without
+    arcs (exact polyline for curved runs) and keeps whichever matches better.
+    This is the generate->verify->keep-if-better guard: arcs are used only when
+    they genuinely help. Returns (part, script, fit_summary)."""
+    loops = [fit_loop(lp, arcs=True) for lp in ext.loops]
     loops = [s for s in loops if s]
     if not loops:
         return None, None, None
     part = _build_part(ext, loops)
+
+    if mesh is not None and _has_arcs(loops):
+        dev = _part_deviation(part, mesh)
+        if dev > dev_tol:
+            loops2 = [fit_loop(lp, arcs=False) for lp in ext.loops]
+            loops2 = [s for s in loops2 if s]
+            part2 = _build_part(ext, loops2)
+            if _part_deviation(part2, mesh) < dev:
+                loops, part = loops2, part2
+
     script = _emit_script(ext, loops)
     from collections import Counter
-    summary = Counter(s.kind for loop in loops for s in loop)
-    return part, script, dict(summary)
+    return part, script, dict(Counter(s.kind for loop in loops for s in loop))
+
+
+def _has_arcs(loops):
+    return any(s.kind == "arc" for loop in loops for s in loop)
+
+
+def _part_deviation(part, mesh):
+    """Max distance from mesh sample points to the built part's surface."""
+    from . import occ_util as ou
+    import trimesh
+    rv, rf = ou.shape_to_mesh(part.wrapped, 0.1)
+    if len(rf) == 0:
+        return float("inf")
+    gm = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+    pts, _ = trimesh.sample.sample_surface(mesh, 20000)
+    _, d, _ = trimesh.proximity.closest_point(gm, np.asarray(pts))
+    return float(np.quantile(d, 0.99))
 
 
 def _build_part(ext, loops):
