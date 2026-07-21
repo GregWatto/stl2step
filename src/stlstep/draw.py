@@ -80,6 +80,143 @@ def _polygons_to_loops(p2d, to_3d, axis):
 
 
 # ----------------------------------------------------------------------------
+# Revolve detection + profile extraction.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Revolution:
+    axis: np.ndarray          # unit axis direction
+    point: np.ndarray         # a point on the axis
+    normal: np.ndarray        # section-plane normal (perp to axis)
+    radial_dir: np.ndarray    # in-plane radial direction (perp to axis)
+    loop: np.ndarray          # (N,2) profile in (radial, axial), radial >= 0
+
+
+def detect_revolve(mesh, *, angles=(37.0, 79.0, 151.0), tol_frac=2e-3):
+    """Return a Revolution if the mesh is rotationally symmetric about a world
+    axis through its centre, else None. Checks that rotating by several angles
+    leaves the shape unchanged, then extracts the (radial, axial) profile."""
+    c = np.asarray(mesh.bounding_box.centroid, dtype=float)
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    for axis in (np.array([0.0, 0, 1]), np.array([0.0, 1, 0]),
+                 np.array([1.0, 0, 0])):
+        if _rot_symmetric(mesh, axis, c, angles, tol_frac * diag):
+            rev = _extract_profile(mesh, axis, c)
+            if rev is not None:
+                return rev
+    return None
+
+
+def _rot_symmetric(mesh, axis, pt, angles, tol):
+    import trimesh
+    pts, _ = trimesh.sample.sample_surface(mesh, 4000)
+    pts = np.asarray(pts)
+    for a in angles:
+        R = trimesh.transformations.rotation_matrix(np.radians(a), axis, pt)
+        rot = mesh.copy(); rot.apply_transform(R)
+        _, d, _ = trimesh.proximity.closest_point(rot, pts)
+        if float(d.max()) > tol:
+            return False
+    return True
+
+
+def _extract_profile(mesh, axis, pt):
+    from shapely.geometry import Polygon, box
+    axis = axis / np.linalg.norm(axis)
+    # a normal perpendicular to the axis (the section plane contains the axis)
+    seed = np.array([1.0, 0, 0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1, 0])
+    normal = np.cross(axis, seed); normal /= np.linalg.norm(normal)
+    # radial_dir = axis x normal so that, on Plane(x_dir=radial_dir, z_dir=normal),
+    # the sketch's local Y (= normal x radial_dir) is +axis, not -axis (which
+    # would build the profile flipped along the axis).
+    radial_dir = np.cross(axis, normal); radial_dir /= np.linalg.norm(radial_dir)
+
+    sec = mesh.section(plane_origin=pt, plane_normal=normal)
+    if sec is None or not sec.discrete:
+        return None
+    loop3d = np.asarray(max(sec.discrete, key=len))
+    rel = loop3d - pt
+    radial = rel @ radial_dir
+    axial = rel @ axis
+    poly = Polygon(np.column_stack([radial, axial]))
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    half = box(0.0, axial.min() - 1, radial.max() + 1, axial.max() + 1)
+    prof = poly.intersection(half)
+    if prof.is_empty or prof.geom_type != "Polygon":
+        return None
+    loop = np.asarray(prof.exterior.coords)
+    return Revolution(axis=axis, point=pt, normal=normal, radial_dir=radial_dir,
+                      loop=loop)
+
+
+def draw_revolve(rev: Revolution, mesh=None, *, dev_tol=0.1):
+    """Build a revolved parametric solid + feature-tree script from a profile."""
+    from build123d import (BuildPart, BuildSketch, BuildLine, Plane, Axis,
+                           Line, ThreePointArc, make_face, revolve)
+    from OCP.gp import gp_Ax1, gp_Pnt, gp_Dir
+
+    segs = fit_loop(rev.loop, arcs=True)
+    if not segs:
+        return None, None, None
+
+    def build(segs_):
+        plane = Plane(origin=tuple(rev.point), x_dir=tuple(rev.radial_dir),
+                      z_dir=tuple(rev.normal))
+        axis = Axis(tuple(rev.point), tuple(rev.axis))
+        with BuildPart() as part:
+            with BuildSketch(plane):
+                with BuildLine():
+                    for s in segs_:
+                        if s.kind == "line":
+                            Line(s.p0, s.p1)
+                        elif s.kind == "arc":
+                            ThreePointArc(s.p0, s.mid, s.p1)
+                make_face()
+            revolve(axis=axis)
+        return part.part
+
+    part = build(segs)
+    if mesh is not None and any(s.kind == "arc" for s in segs):
+        if _part_deviation(part, mesh) > dev_tol:
+            segs2 = fit_loop(rev.loop, arcs=False)
+            part2 = build(segs2)
+            if _part_deviation(part2, mesh) < _part_deviation(part, mesh):
+                segs, part = segs2, part2
+
+    script = _emit_revolve_script(rev, segs)
+    from collections import Counter
+    return part, script, dict(Counter(s.kind for s in segs))
+
+
+def _emit_revolve_script(rev, segs):
+    def f(x):
+        return f"{float(x):.6g}"
+
+    def vec(v):
+        return "(" + ", ".join(f(x) for x in v) + ")"
+
+    L = ["from build123d import *", "",
+         f"# Reconstructed revolve about axis {[round(float(x),3) for x in rev.axis]} "
+         f"through {[round(float(x),3) for x in rev.point]}", "",
+         "with BuildPart() as part:",
+         f"    with BuildSketch(Plane(origin={vec(rev.point)}, "
+         f"x_dir={vec(rev.radial_dir)}, z_dir={vec(rev.normal)})):",
+         "        with BuildLine():"]
+    for s in segs:
+        if s.kind == "line":
+            L.append(f"            Line(({f(s.p0[0])}, {f(s.p0[1])}), "
+                     f"({f(s.p1[0])}, {f(s.p1[1])}))")
+        elif s.kind == "arc":
+            L.append(f"            ThreePointArc(({f(s.p0[0])}, {f(s.p0[1])}), "
+                     f"({f(s.mid[0])}, {f(s.mid[1])}), "
+                     f"({f(s.p1[0])}, {f(s.p1[1])}))")
+    L.append("        make_face()")
+    L.append(f"    revolve(axis=Axis({vec(rev.point)}, {vec(rev.axis)}))")
+    return "\n".join(L)
+
+
+# ----------------------------------------------------------------------------
 # 2D profile fitting: polyline -> lines + arcs.
 # ----------------------------------------------------------------------------
 
