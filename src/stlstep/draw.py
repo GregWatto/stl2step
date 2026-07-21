@@ -36,11 +36,14 @@ class DrawResult:
 
 
 def draw(mesh, *, dev_tol=0.1):
-    """Try to reconstruct `mesh` as a parametric feature model. Attempts each
-    recognizer (extrusion, revolve), builds + verifies against the mesh, and
-    returns the lowest-deviation result that meets `dev_tol`. Returns None if
-    the part isn't a clean single-feature solid (caller falls back to BREP)."""
-    candidates = []
+    """Try to reconstruct `mesh` as a parametric feature model, cheapest model
+    first. Tier 1 is a single feature (extrusion / revolve) — the simplest, most
+    editable result, preferred whenever it fits. Tier 2 is a multi-level
+    prismatic stack (base + boss + pocket + step + holes). Every candidate is
+    built and verified against the mesh; returns the best passing result, or None
+    if nothing fits within `dev_tol` (caller falls back to BREP)."""
+    # Tier 1: single-feature recognizers.
+    single = []
     for name, detect, build in (("extrude", detect_extrusion, draw_extrusion),
                                 ("revolve", detect_revolve, draw_revolve)):
         try:
@@ -50,14 +53,26 @@ def draw(mesh, *, dev_tol=0.1):
             part, script, summary = build(spec, mesh=mesh)
             if part is None:
                 continue
-            dev = _part_deviation(part, mesh)
-            candidates.append(DrawResult(name, part, script, summary, dev))
+            single.append(DrawResult(name, part, script, summary,
+                                     _part_deviation(part, mesh)))
         except Exception:  # noqa: BLE001 — a recognizer failing is not fatal
             continue
-    passing = [c for c in candidates if c.deviation <= dev_tol]
-    if not passing:
-        return None
-    return min(passing, key=lambda c: c.deviation)
+    passing = [c for c in single if c.deviation <= dev_tol]
+    if passing:
+        return min(passing, key=lambda c: c.deviation)
+
+    # Tier 2: multi-feature prismatic stack.
+    try:
+        pr = detect_prismatic(mesh)
+        if pr is not None:
+            part, script, summary = draw_prismatic(pr, mesh=mesh, dev_tol=dev_tol)
+            if part is not None:
+                dev = _part_deviation(part, mesh)
+                if dev <= dev_tol:
+                    return DrawResult("prismatic", part, script, summary, dev)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -115,6 +130,126 @@ def _polygons_to_loops(p2d, to_3d, axis):
                 np.column_stack([pts2d, np.zeros(len(pts2d))]), to_3d)
             loops.append(pts3d[:, [u, v]])
     return loops
+
+
+# ----------------------------------------------------------------------------
+# Prismatic (2.5D) multi-feature detection.
+#
+# The natural generalization of a single extrusion: a part built as a stack of
+# extruded layers along one axis — base plate + raised boss + blind pocket +
+# steps + through-holes. We find the axis heights where the cross-section changes
+# (the axis-perpendicular flat caps: plate faces, pocket floors, step shoulders),
+# slice each constant-section slab, and rebuild as a UNION of per-slab extrudes.
+# Union reproduces bosses (a slab adds material), blind pockets (the slab below
+# the floor fills in), and through-holes (absent from every slab) automatically —
+# no explicit add-vs-subtract classification of features is needed.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Prismatic:
+    axis: int                 # 0=x, 1=y, 2=z (the layering axis)
+    levels: list              # [(lo, hi, polys), ...] bottom->top; polys is a
+                              # list of (exterior (N,2), [interior (M,2), ...])
+
+
+def detect_prismatic(mesh, *, angle_tol_deg=2.0):
+    """Return a Prismatic if the part is a stack of >=2 constant-section slabs
+    along some axis, else None. Picks the axis with the most flat-cap area (the
+    dominant layering direction), falling back to another axis if that one has
+    no interior section change."""
+    fn = np.asarray(mesh.face_normals, dtype=float)
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    cos_tol = np.cos(np.radians(angle_tol_deg))
+    cap_area = [float(areas[np.abs(fn[:, a]) > cos_tol].sum()) for a in (0, 1, 2)]
+    for axis in sorted((0, 1, 2), key=lambda a: -cap_area[a]):
+        levels = _prismatic_levels(mesh, axis, cos_tol)
+        if levels is not None:
+            return Prismatic(axis=axis, levels=levels)
+    return None
+
+
+def _prismatic_levels(mesh, axis, cos_tol, *, min_slab_frac=0.01):
+    """Slab boundaries along `axis`: the axis coordinates of the flat caps
+    (faces whose normal is ~parallel to the axis). Requires >=1 interior break
+    (i.e. a genuine multi-level part, not a plain extrusion)."""
+    fn = np.asarray(mesh.face_normals, dtype=float)
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces)
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    length = hi - lo
+    if length <= 1e-6:
+        return None
+    coord_tol = max(1e-3 * length, 0.02)
+
+    perp = np.abs(fn[:, axis]) > cos_tol
+    if not perp.any():
+        return None
+    cap_coord = V[F[perp]][:, :, axis].mean(axis=1)   # per-cap axis coordinate
+    breaks = _cluster_coords(cap_coord, coord_tol, areas[perp])
+    interior = sorted(b for b in breaks if lo + coord_tol < b < hi - coord_tol)
+
+    bounds = [lo]
+    for b in interior + [hi]:
+        if b - bounds[-1] > coord_tol:
+            bounds.append(b)
+    if len(bounds) < 3:            # no interior break -> a plain extrusion
+        return None
+
+    levels = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b - a < max(coord_tol, min_slab_frac * length):
+            continue
+        polys = _section_polys(mesh, axis, 0.5 * (a + b))
+        if not polys:
+            return None
+        levels.append((a, b, polys))
+    return levels if len(levels) >= 2 else None
+
+
+def _cluster_coords(coords, tol, weights, *, min_weight_frac=0.02):
+    """1D clustering: merge sorted coordinates within `tol`, area-weighted.
+    Drops clusters whose total area is a negligible fraction of the largest
+    (stray triangles) so they don't create phantom breakpoints."""
+    coords = np.asarray(coords, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if len(coords) == 0:
+        return []
+    order = np.argsort(coords)
+    coords, weights = coords[order], weights[order]
+    centers, cw = [], []
+    cur_c, cur_w = [coords[0]], [weights[0]]
+    for c, w in zip(coords[1:], weights[1:]):
+        if c - cur_c[-1] <= tol:
+            cur_c.append(c); cur_w.append(w)
+        else:
+            centers.append(np.average(cur_c, weights=cur_w)); cw.append(sum(cur_w))
+            cur_c, cur_w = [c], [w]
+    centers.append(np.average(cur_c, weights=cur_w)); cw.append(sum(cur_w))
+    thresh = min_weight_frac * max(cw)
+    return [ct for ct, w in zip(centers, cw) if w >= thresh]
+
+
+def _section_polys(mesh, axis, coord):
+    """Cross-section at `coord` along `axis` as a list of polygons, each
+    (exterior (N,2), [interior (M,2), ...]) in world (u, v) coords. None if the
+    plane misses the mesh."""
+    normal = np.zeros(3); normal[axis] = 1.0
+    origin = np.zeros(3); origin[axis] = coord
+    sec = mesh.section(plane_origin=origin, plane_normal=normal)
+    if sec is None:
+        return None
+    p2d, to_3d = sec.to_2D()
+    u, v = [c for c in (0, 1, 2) if c != axis]
+
+    def world_uv(ring):
+        pts2d = np.asarray(ring.coords)
+        pts3d = trimesh.transformations.transform_points(
+            np.column_stack([pts2d, np.zeros(len(pts2d))]), to_3d)
+        return pts3d[:, [u, v]]
+
+    polys = [(world_uv(poly.exterior), [world_uv(r) for r in poly.interiors])
+             for poly in p2d.polygons_full]
+    return polys or None
 
 
 # ----------------------------------------------------------------------------
@@ -251,6 +386,93 @@ def _emit_revolve_script(rev, segs):
                      f"({f(s.p1[0])}, {f(s.p1[1])}))")
     L.append("        make_face()")
     L.append(f"    revolve(axis=Axis({vec(rev.point)}, {vec(rev.axis)}))")
+    return "\n".join(L)
+
+
+# ----------------------------------------------------------------------------
+# Draw: prismatic stack -> union of per-slab extrudes + emitted script.
+# ----------------------------------------------------------------------------
+
+def draw_prismatic(pr: Prismatic, mesh=None, *, dev_tol=0.1):
+    """Build the multi-level prismatic solid + feature-tree script. Fits each
+    slab's cross-section (outer + holes) into lines/arcs/circles and builds the
+    part as a union of per-slab extrudes. verify-and-fallback: if arcs push the
+    result past tolerance, refit the curved runs as exact polylines."""
+    fitted = _fit_prismatic(pr, arcs=True)
+    if fitted is None:
+        return None, None, None
+    part = _build_prismatic(pr, fitted)
+    if part is None:
+        return None, None, None
+
+    if mesh is not None and _prismatic_has_arcs(fitted):
+        dev = _part_deviation(part, mesh)
+        if dev > dev_tol:
+            fitted2 = _fit_prismatic(pr, arcs=False)
+            part2 = _build_prismatic(pr, fitted2) if fitted2 else None
+            if part2 is not None and _part_deviation(part2, mesh) < dev:
+                fitted, part = fitted2, part2
+
+    script = _emit_prismatic_script(pr, fitted)
+    from collections import Counter
+    kinds = Counter(s.kind for _, _, lvl in fitted for es, hs in lvl
+                    for grp in [es, *hs] for s in grp)
+    summary = dict(kinds); summary["levels"] = len(fitted)
+    return part, script, summary
+
+
+def _fit_prismatic(pr, *, arcs):
+    """Fit every slab's loops. Returns [(lo, hi, [(ext_segs, [hole_segs...]), ...])]
+    or None if any exterior loop fails to fit."""
+    fitted = []
+    for lo, hi, polys in pr.levels:
+        lvl = []
+        for ext, ints in polys:
+            es = fit_loop(ext, arcs=arcs)
+            if not es:
+                return None
+            hs = [h for h in (fit_loop(hole, arcs=arcs) for hole in ints) if h]
+            lvl.append((es, hs))
+        fitted.append((lo, hi, lvl))
+    return fitted
+
+
+def _prismatic_has_arcs(fitted):
+    return any(s.kind == "arc" for _, _, lvl in fitted for es, hs in lvl
+              for grp in [es, *hs] for s in grp)
+
+
+def _build_prismatic(pr, fitted):
+    from build123d import BuildPart, BuildSketch, Plane, Mode, extrude
+    base = getattr(Plane, _PLANE[pr.axis])
+    try:
+        with BuildPart() as part:
+            for lo, hi, lvl in fitted:
+                with BuildSketch(base.offset(lo)):
+                    for es, hs in lvl:
+                        _sketch_loop(es, Mode.ADD)
+                        for h in hs:
+                            _sketch_loop(h, Mode.SUBTRACT)
+                extrude(amount=hi - lo)   # ADD: unions with the stack so far
+        return part.part
+    except Exception:  # noqa: BLE001 — a bad slab must not crash the dispatcher
+        return None
+
+
+def _emit_prismatic_script(pr, fitted):
+    pl = _PLANE[pr.axis]
+    L = ["from build123d import *", "",
+         f"# Reconstructed prismatic stack along {pl} normal, "
+         f"{len(fitted)} levels (union of per-slab extrudes)", "",
+         "with BuildPart() as part:"]
+    for k, (lo, hi, lvl) in enumerate(fitted):
+        L.append(f"    # level {k + 1}: {pl} offset {_fmt(lo)} -> {_fmt(hi)}")
+        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(lo)})):")
+        for j, (es, hs) in enumerate(lvl):
+            for grp, suffix in [(es, "")] + [(h, ", mode=Mode.SUBTRACT")
+                                             for h in hs]:
+                L.extend(_emit_loop_lines(grp, suffix, 8))
+        L.append(f"    extrude(amount={_fmt(hi - lo)})")
     return "\n".join(L)
 
 
@@ -425,61 +647,82 @@ def _part_deviation(part, mesh):
 
 
 def _build_part(ext, loops):
-    from build123d import (BuildPart, BuildSketch, BuildLine, Plane, Circle,
-                           Locations, Line, ThreePointArc, make_face, extrude,
-                           Mode)
+    from build123d import BuildPart, BuildSketch, Plane, Mode, extrude
     plane = getattr(Plane, _PLANE[ext.axis]).offset(ext.origin_offset)
     with BuildPart() as part:
         with BuildSketch(plane):
             for i, segs in enumerate(loops):
-                mode = Mode.ADD if i == 0 else Mode.SUBTRACT
-                if len(segs) == 1 and segs[0].kind == "circle":
-                    c = segs[0]
-                    with Locations((c.center[0], c.center[1])):
-                        Circle(c.radius, mode=mode)
-                else:
-                    with BuildLine():
-                        for s in segs:
-                            if s.kind == "line":
-                                Line(s.p0, s.p1)
-                            elif s.kind == "arc":
-                                ThreePointArc(s.p0, s.mid, s.p1)
-                    make_face(mode=mode)
+                _sketch_loop(segs, Mode.ADD if i == 0 else Mode.SUBTRACT)
         extrude(amount=ext.length)
     return part.part
 
 
-def _emit_script(ext, loops):
-    """Emit a readable, runnable build123d feature script — the feature tree."""
-    def f(x):
-        return f"{x:.6g}"
-    L = ["from build123d import *", "",
-         f"# Reconstructed extrusion along {_PLANE[ext.axis]} normal, "
-         f"length {f(ext.length)} mm", "",
-         "with BuildPart() as part:",
-         f"    with BuildSketch(Plane.{_PLANE[ext.axis]}"
-         f".offset({f(ext.origin_offset)})):"]
-    for i, segs in enumerate(loops):
-        mode = "" if i == 0 else ", mode=Mode.SUBTRACT"
-        tag = "outer profile" if i == 0 else "hole"
-        L.append(f"        # {tag}")
-        if len(segs) == 1 and segs[0].kind == "circle":
-            c = segs[0]
-            L.append(f"        with Locations(({f(c.center[0])}, "
-                     f"{f(c.center[1])})):")
-            L.append(f"            Circle({f(c.radius)}{mode})")
-        else:
-            L.append("        with BuildLine():")
+def _sketch_loop(segs, mode):
+    """Add one fitted loop (a circle, or a lines/arcs wire) to the currently
+    open BuildSketch, in the given ADD/SUBTRACT mode. build123d's builder stack
+    picks up the active sketch, so this composes inside a `with BuildSketch(..)`."""
+    from build123d import (BuildLine, Locations, Circle, Line, ThreePointArc,
+                           make_face)
+    if len(segs) == 1 and segs[0].kind == "circle":
+        c = segs[0]
+        with Locations((c.center[0], c.center[1])):
+            Circle(c.radius, mode=mode)
+    else:
+        # Pass the wire explicitly: build123d's argument-less make_face() relies
+        # on caller-frame inspection and finds nothing when called from a helper.
+        with BuildLine() as bl:
             for s in segs:
                 if s.kind == "line":
-                    L.append(f"            Line(({f(s.p0[0])}, {f(s.p0[1])}), "
-                             f"({f(s.p1[0])}, {f(s.p1[1])}))")
-                else:
-                    L.append(f"            ThreePointArc(({f(s.p0[0])}, "
-                             f"{f(s.p0[1])}), ({f(s.mid[0])}, {f(s.mid[1])}), "
-                             f"({f(s.p1[0])}, {f(s.p1[1])}))")
-            L.append(f"        make_face({mode.lstrip(', ')})")
-    L.append(f"    extrude(amount={f(ext.length)})")
+                    Line(s.p0, s.p1)
+                elif s.kind == "arc":
+                    ThreePointArc(s.p0, s.mid, s.p1)
+        make_face(bl.line, mode=mode)
+
+
+def _fmt(x):
+    x = float(x)
+    if abs(x) < 1e-9:            # snap numerical dust to a clean 0
+        x = 0.0
+    return f"{x:.6g}"
+
+
+def _emit_loop_lines(segs, mode_suffix, indent):
+    """Emit the sketch body for one loop (Circle, or BuildLine + make_face) as
+    source lines at the given indent. `mode_suffix` is "" or ", mode=Mode.SUBTRACT"."""
+    pad = " " * indent
+    L = []
+    if len(segs) == 1 and segs[0].kind == "circle":
+        c = segs[0]
+        L.append(f"{pad}with Locations(({_fmt(c.center[0])}, "
+                 f"{_fmt(c.center[1])})):")
+        L.append(f"{pad}    Circle({_fmt(c.radius)}{mode_suffix})")
+    else:
+        L.append(f"{pad}with BuildLine():")
+        for s in segs:
+            if s.kind == "line":
+                L.append(f"{pad}    Line(({_fmt(s.p0[0])}, {_fmt(s.p0[1])}), "
+                         f"({_fmt(s.p1[0])}, {_fmt(s.p1[1])}))")
+            else:
+                L.append(f"{pad}    ThreePointArc(({_fmt(s.p0[0])}, "
+                         f"{_fmt(s.p0[1])}), ({_fmt(s.mid[0])}, {_fmt(s.mid[1])}), "
+                         f"({_fmt(s.p1[0])}, {_fmt(s.p1[1])}))")
+        L.append(f"{pad}make_face({mode_suffix.lstrip(', ')})")
+    return L
+
+
+def _emit_script(ext, loops):
+    """Emit a readable, runnable build123d feature script — the feature tree."""
+    L = ["from build123d import *", "",
+         f"# Reconstructed extrusion along {_PLANE[ext.axis]} normal, "
+         f"length {_fmt(ext.length)} mm", "",
+         "with BuildPart() as part:",
+         f"    with BuildSketch(Plane.{_PLANE[ext.axis]}"
+         f".offset({_fmt(ext.origin_offset)})):"]
+    for i, segs in enumerate(loops):
+        mode = "" if i == 0 else ", mode=Mode.SUBTRACT"
+        L.append(f"        # {'outer profile' if i == 0 else 'hole'}")
+        L.extend(_emit_loop_lines(segs, mode, 8))
+    L.append(f"    extrude(amount={_fmt(ext.length)})")
     return "\n".join(L)
 
 
