@@ -1,0 +1,14 @@
+# Python environment (recreate with requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+.claude/
+
+# Generated output (STEP files, reports, colormaps go to /tmp by default)
+/out/
+*.report/
+scratchpad/
