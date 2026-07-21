@@ -137,9 +137,12 @@ def _curvature_fit(run, arc_min_pts, line_tol, arc_resid_frac, arcs,
                    curve_deg=4.0):
     """Split an inter-corner run into lines and arcs by turning rate. A straight
     edge turns ~0 per vertex; a smooth arc turns by a small, consistent amount.
-    Group consecutive edges as curved vs straight (rather than greedily growing a
-    circle, which lets an arc swallow a tangent straight edge), then fit an arc
-    to each curved group and a line to each straight group."""
+
+    Group by *curved vertices* (not edges): an arc spans the maximal run of
+    turning vertices, so its endpoints are the tangent junction points and the
+    circle fit uses only on-arc points — a flanking straight point can't pull the
+    radius. Straight stretches between arcs become single lines that share those
+    junction points."""
     run = np.asarray(run, dtype=float)
     m = len(run)
     if m < 3:
@@ -147,29 +150,29 @@ def _curvature_fit(run, arc_min_pts, line_tol, arc_resid_frac, arcs,
     d = run[1:] - run[:-1]
     ang = np.arctan2(d[:, 1], d[:, 0])
     turn = np.abs(_wrap(np.diff(ang)))                 # turning at vertices 1..m-2
-    curved_v = turn >= np.radians(curve_deg)           # per interior vertex
-    # an edge is curved if either of its endpoints turns
-    edge_curved = np.zeros(m - 1, dtype=bool)
-    for k in range(m - 1):
-        left = curved_v[k - 1] if k - 1 >= 0 and k - 1 < len(curved_v) else False
-        right = curved_v[k] if k < len(curved_v) else False
-        edge_curved[k] = bool(left or right)
+    vc = np.zeros(m, dtype=bool)
+    vc[1:m - 1] = turn >= np.radians(curve_deg)        # curved vertices
 
     segs = []
-    i = 0
-    while i < m - 1:
-        j = i
-        while j + 1 < m - 1 and edge_curved[j + 1] == edge_curved[i]:
-            j += 1
-        grp = run[i:j + 2]                             # points of edges i..j
-        if edge_curved[i] and len(grp) >= arc_min_pts:
-            seg = _fit_arc_group(grp, line_tol, arc_resid_frac) if arcs else None
-            # curved run: an arc if one fits (and arcs enabled), else keep the
-            # exact polyline so it stays dimensionally accurate
-            segs.extend([seg] if seg else _polyline_segs(grp))
-        else:
-            segs.append(Seg("line", tuple(grp[0]), tuple(grp[-1])))
-        i = j + 1
+    prev = 0                                            # index up to which emitted
+    v = 1
+    while v < m - 1:
+        if not vc[v]:
+            v += 1
+            continue
+        s = v
+        while v < m - 1 and vc[v]:
+            v += 1
+        t = v - 1                                       # last curved vertex
+        if s > prev:                                    # straight lead-in
+            segs.append(Seg("line", tuple(run[prev]), tuple(run[s])))
+        grp = run[s:t + 1]
+        seg = (_fit_arc_group(grp, line_tol, arc_resid_frac)
+               if arcs and len(grp) >= arc_min_pts else None)
+        segs.extend([seg] if seg else _polyline_segs(grp))
+        prev = t
+    if prev < m - 1:                                    # straight tail
+        segs.append(Seg("line", tuple(run[prev]), tuple(run[m - 1])))
     return segs
 
 
