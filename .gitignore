@@ -12,3 +12,7 @@ __pycache__/
 /out/
 *.report/
 scratchpad/
+
+# root-level scratch / generated output
+/*.step
+/*_report/
