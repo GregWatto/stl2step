@@ -38,17 +38,31 @@ python -m stlstep.convert part.stl -o part.step --report out/ [--method merged]
 `--report out/` writes `report.json` (the full gate verdict) and `deviation.png`
 (the colormap). Exit code is non-zero when the gate fails.
 
-Methods (see [`docs/topology-experiments.md`](docs/topology-experiments.md)):
-- `facets`: one BRep face per triangle. Dimensionally exact, watertight, 0% reduction.
-- `merged`: watertight planar-merge (coplanar faces collapsed); curved regions faceted.
+Two reconstruction strategies:
+
+**1. Draw it (parametric feature model)** — `src/stlstep/draw.py`. Recognize how
+the part was built and re-draw it with feature operations, so topology is correct
+by construction. Emits a runnable **build123d feature-tree script** (the editable
+recipe) plus the STEP. Recognizers:
+- **extrusion** — constant cross-section along an axis → sketch + `extrude`
+- **revolve** — rotational symmetry about an axis → profile + `revolve`
+
+Profiles are fitted to clean lines / arcs / circles (curvature-based, tangent-arc
+radii exact) with a **verify-and-fallback** guard: fit with arcs, verify the
+built solid against the mesh, and drop the arcs if they made it worse. On the
+test parts: vslot → extrude (0.012mm), shaft → revolve (0.002mm), both round-trip.
+
+**2. BREP methods** (fallback when the part isn't a single feature), see
+[`docs/topology-experiments.md`](docs/topology-experiments.md):
+- `facets`: one face per triangle. Exact, watertight, 0% reduction.
+- `merged`: watertight planar-merge; curved regions faceted.
 - `shell`: analytic faces, non-watertight (reference only).
-- **`solid` (the main output)**: watertight solid with **analytic surfaces and
-  clean analytic edges**. Each region → an analytic face (cylinder/plane/cone/
-  sphere/torus); curved faces built via the uv-bounded seam constructor, plane
-  boundaries from real `GeomAPI_IntSS` intersection curves (circles/lines). Bad
-  fits fall back region-by-region (clean → polyline merge → facet), guarded by an
-  area+validity+bidirectional-deviation check, so the solid is always valid and
-  correct-volume.
+- `solid`: watertight solid with analytic surfaces + clean intersection-curve
+  edges, guarded by area+validity+bidirectional-deviation, region-by-region
+  fallback (clean → polyline merge → NURBS drape → facet).
+
+**`auto`** (default) dispatches: try to draw a feature model; if the part isn't a
+clean extrude/revolve, fall back to the `solid` BREP method.
 
 ## Status (region-growing segmentation + `solid`)
 

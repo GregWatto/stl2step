@@ -23,6 +23,44 @@ import trimesh
 
 
 # ----------------------------------------------------------------------------
+# Dispatcher: try each feature reconstruction, keep the best that verifies.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class DrawResult:
+    method: str               # "extrude" | "revolve"
+    part: object              # build123d Part
+    script: str               # feature-tree script
+    summary: dict             # segment kind counts
+    deviation: float          # p99 distance to the mesh (mm)
+
+
+def draw(mesh, *, dev_tol=0.1):
+    """Try to reconstruct `mesh` as a parametric feature model. Attempts each
+    recognizer (extrusion, revolve), builds + verifies against the mesh, and
+    returns the lowest-deviation result that meets `dev_tol`. Returns None if
+    the part isn't a clean single-feature solid (caller falls back to BREP)."""
+    candidates = []
+    for name, detect, build in (("extrude", detect_extrusion, draw_extrusion),
+                                ("revolve", detect_revolve, draw_revolve)):
+        try:
+            spec = detect(mesh)
+            if spec is None:
+                continue
+            part, script, summary = build(spec, mesh=mesh)
+            if part is None:
+                continue
+            dev = _part_deviation(part, mesh)
+            candidates.append(DrawResult(name, part, script, summary, dev))
+        except Exception:  # noqa: BLE001 — a recognizer failing is not fatal
+            continue
+    passing = [c for c in candidates if c.deviation <= dev_tol]
+    if not passing:
+        return None
+    return min(passing, key=lambda c: c.deviation)
+
+
+# ----------------------------------------------------------------------------
 # Extrusion detection + profile extraction.
 # ----------------------------------------------------------------------------
 
