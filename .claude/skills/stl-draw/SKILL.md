@@ -54,8 +54,15 @@ Then **study the part**:
   cylinders labelled hole-vs-boss with Ø, axis, length, endpoints; cones; tori;
   freeform patches), the bounding box, volume, and what the deterministic
   recognizers saw.
-- **Read the render** with the Read tool: `<WORKDIR>/part_views.png` (four shaded
+- **Read the shaded render** with the Read tool: `<WORKDIR>/part_views.png` (four
   views). Confirm the arrangement of features matches the numbers.
+- **Read the cross-sections**: `<WORKDIR>/part_sections.png` (two axial + two
+  transverse slices). These reveal the INTERNAL geometry the shaded views hide —
+  cavity floor heights, counterbore steps, wall thicknesses, chamfers. Read exact
+  depths and radii off them; they are usually the fastest way to get the interior
+  right.
+- Treat analytic fits as hints, not truth: a large-radius sphere/torus is often a
+  degenerate fit to a nearly-flat or stepped region — trust the cross-section.
 - Full detail is in `<WORKDIR>/analysis.json` if you need it.
 
 ### 3. Compose a build123d script (this is the "drawing")

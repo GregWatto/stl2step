@@ -216,6 +216,73 @@ def render_views(mesh: trimesh.Trimesh, path: str, *, title: str = "",
     return path
 
 
+def dominant_axis(mesh: trimesh.Trimesh, analysis: dict) -> int:
+    """The part's main axis (0/1/2): the world axis most cylinder area aligns
+    with, else the prismatic-stack axis, else the longest bbox dimension. Used to
+    orient the cross-sections."""
+    score = [0.0, 0.0, 0.0]
+    for s in analysis["surfaces"]:
+        if s["kind"] == "cylinder":
+            ax = np.abs(np.asarray(s["axis"], dtype=float))
+            i = int(np.argmax(ax))
+            if ax[i] > 0.9:
+                score[i] += float(s.get("area_mm2", 0) or 0)
+    if max(score) > 0:
+        return int(np.argmax(score))
+    pr = analysis.get("deterministic_recognizers", {}).get("prismatic")
+    if pr:
+        return "xyz".index(pr["axis"])
+    return int(np.argmax(analysis["bounding_box"]["size"]))
+
+
+def render_sections(mesh: trimesh.Trimesh, path: str, axis: int,
+                    *, title: str = "") -> str:
+    """Cross-section line drawings — the view that reveals INTERNAL geometry
+    (cavity floors, counterbores, wall thicknesses) that shaded 3D renders hide.
+    Two axial slices (planes containing `axis`, seen from the two perpendicular
+    directions) + two transverse slices (perpendicular to `axis`)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = ["X", "Y", "Z"]
+    c = 0.5 * (np.asarray(mesh.bounds[0]) + np.asarray(mesh.bounds[1]))
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    others = [i for i in (0, 1, 2) if i != axis]
+
+    panels = []
+    # two axial slices: plane normal = each perpendicular axis, through centre
+    for j in others:
+        k = [i for i in others if i != j][0]        # in-plane horizontal axis
+        origin = c.copy()
+        panels.append(("axial", tuple(origin), j, k, axis,
+                       f"axial slice (normal {names[j]}):  {names[k]} vs {names[axis]} (axis)"))
+    # two transverse slices at 1/3 and 2/3 of the axis span
+    for frac in (0.34, 0.66):
+        origin = c.copy(); origin[axis] = lo + frac * (hi - lo)
+        panels.append(("trans", tuple(origin), axis, others[0], others[1],
+                       f"cross slice at {names[axis]}={origin[axis]:.1f}:  "
+                       f"{names[others[0]]} vs {names[others[1]]}"))
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.6))
+    for ax, (kind, origin, jn, hax, vax, lab) in zip(axes, panels):
+        normal = [0, 0, 0]; normal[jn] = 1
+        sec = mesh.section(plane_origin=list(origin), plane_normal=normal)
+        if sec is not None:
+            for ent in sec.discrete:
+                p = np.asarray(ent)
+                ax.plot(p[:, hax], p[:, vax], "k-", lw=0.9)
+        ax.set_aspect("equal"); ax.grid(True, alpha=0.3)
+        ax.axhline(0, color="r", lw=0.4); ax.axvline(0, color="r", lw=0.4)
+        ax.set_xlabel(names[hax]); ax.set_ylabel(names[vax])
+        ax.set_title(lab, fontsize=8)
+        ax.tick_params(labelsize=6)
+    fig.suptitle(title or "Cross-sections (reveal internal geometry)", fontsize=11)
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 # ----------------------------------------------------------------------------
 # The brief — the drawing task package handed to the composer.
 # ----------------------------------------------------------------------------
@@ -226,6 +293,7 @@ class Brief:
     analysis: dict
     views_png: str
     mesh: trimesh.Trimesh
+    sections_png: str | None = None
 
     def prompt_text(self) -> str:
         """The textual half of the drawing task (analysis + instructions)."""
@@ -235,9 +303,15 @@ class Brief:
 
 DRAW_INSTRUCTIONS = """\
 You are reconstructing a mechanical part as clean, editable CAD. You are given a
-dimensioned analysis of a triangle mesh and shaded rendered views of it. Write a
-build123d Python script that draws the part as a feature model (sketches +
-extrude/revolve/holes/fillets), matching the real geometry.
+dimensioned analysis of a triangle mesh, shaded rendered views, and CROSS-SECTION
+drawings. Write a build123d Python script that draws the part as a feature model
+(sketches + extrude/revolve/holes/fillets), matching the real geometry.
+
+Read the cross-sections carefully: they reveal INTERNAL geometry the shaded views
+hide — cavity floor heights, counterbore steps, wall thicknesses, chamfers. Read
+exact depths and radii off them. Treat analytic fits in the analysis as hints, not
+truth: a large-radius sphere/torus is often a degenerate fit to a nearly-flat or
+stepped region — trust the cross-section over it.
 
 Rules:
 - Output ONLY a Python code block: a build123d script. No prose outside it.
@@ -259,12 +333,20 @@ def build_brief(mesh: trimesh.Trimesh, workdir: str) -> Brief:
     size = analysis["bounding_box"]["size"]
     views = os.path.join(workdir, "part_views.png")
     render_views(mesh, views, title=f"Target part  —  bbox {size} mm")
+    axis = dominant_axis(mesh, analysis)
+    sections = os.path.join(workdir, "part_sections.png")
+    try:
+        render_sections(mesh, sections, axis,
+                        title=f"Cross-sections (axis = {'XYZ'[axis]})")
+    except Exception:  # noqa: BLE001 — sections are a bonus, never fatal
+        sections = None
     with open(os.path.join(workdir, "analysis.json"), "w") as fp:
         json.dump(analysis, fp, indent=2)
+    brief = Brief(workdir, analysis, views, mesh, sections_png=sections)
     with open(os.path.join(workdir, "brief.md"), "w") as fp:
-        fp.write(f"# Drawing brief\n\nViews: `part_views.png`\n\n"
-                 + Brief(workdir, analysis, views, mesh).prompt_text())
-    return Brief(workdir, analysis, views, mesh)
+        fp.write(f"# Drawing brief\n\nViews: `part_views.png`\n"
+                 f"Cross-sections: `part_sections.png`\n\n" + brief.prompt_text())
+    return brief
 
 
 # ----------------------------------------------------------------------------
@@ -453,9 +535,14 @@ class AnthropicComposer(Composer):
 
     def propose(self, brief: Brief, history: list[Candidate]) -> str:
         mesh_vol = float(brief.mesh.volume) if brief.mesh.is_watertight else None
-        messages = [{"role": "user", "content": [
-            {"type": "text", "text": brief.prompt_text()},
-            _img_block(brief.views_png)]}]
+        content = [{"type": "text", "text": brief.prompt_text()},
+                   {"type": "text", "text": "Shaded views:"},
+                   _img_block(brief.views_png)]
+        if brief.sections_png:
+            content.append({"type": "text", "text": "Cross-sections (internal "
+                            "geometry — cavity floors, counterbores, wall depths):"})
+            content.append(_img_block(brief.sections_png))
+        messages = [{"role": "user", "content": content}]
         for cand in history:
             messages.append({"role": "assistant",
                              "content": "```python\n" + cand.script + "\n```"})
@@ -540,6 +627,8 @@ def _cli_brief(args) -> int:
     print(f"brief written to {args.workdir}/")
     print(f"  analysis : {args.workdir}/analysis.json")
     print(f"  views    : {brief.views_png}   <- Read this image")
+    if brief.sections_png:
+        print(f"  sections : {brief.sections_png}   <- Read this (INTERNAL geometry)")
     print(f"  bbox {a['bounding_box']['size']} mm  min {a['bounding_box']['min']}  "
           f"volume {a['volume_mm3']} mm^3  watertight={a['watertight']}")
     print(f"  deterministic recognizers: {a['deterministic_recognizers']}")
