@@ -91,3 +91,33 @@ converters and wins on prismatic parts; the draw path is genuinely differentiate
 (editable feature trees). If the user just needs results on a given part, Fusion's
 paid Mesh workspace is the pragmatic alternative — worth re-checking against real
 parts before large further investment.
+
+### Open-source landscape survey (2026-07, two research agents + verified)
+
+Decision: **keep building our own core loop; adopt ideas, not systems.** Findings:
+- **No turnkey OSS does mesh → editable feature tree + STEP.** Confirmed. The niche
+  is real and unfilled.
+- **All classical feature recognizers consume B-rep/STEP, not mesh** (Analysis
+  Situs [BSD, basic recognizers only; full CNC suite is commercial], AAGNet [MIT,
+  ML], MFCAD, BRepNet). So they can't take our mesh input without first solving
+  mesh→B-rep — the hard problem. Not adoptable for our front end. (They *could* run
+  on our BREP `solid` output later, if we ever want features from that.)
+- **LLM→CAD-code line is closest to us** but outputs CadQuery from POINT CLOUDS,
+  not build123d feature trees from mesh: **CAD-Recode** (ICCV2025, MIT, weights,
+  easiest to run), **cadrille** (ICLR2026, Apache-2.0, multi-modal incl. rendered
+  images, weights). Adoptable only as an optional GPU-backed **first-guess
+  composer** to jump-start the loop — an enhancement, not core.
+- **CADFit** (ICML2026, arxiv 2605.01171, repo ghadinehme/CADFit) is essentially
+  our architecture, published: **mesh → editable CAD program**, incremental
+  fit-and-validate of parametric ops (extrude/revolve/fillet/chamfer via bool)
+  with **IoU/geometric feedback**. Validates our approach AND confirms no shipped
+  product. **CADReasoner** (CVPR2026) = the iterative render→compare→refine loop.
+- **Point2CAD** (CVPR2024) = pointcloud→surfaces+topology, but CC-BY-NC
+  (commercial blocker) + needs pre-segmentation. **Don't** replace the numpy
+  segmenter with CGAL — works, not the bottleneck.
+
+**The one idea to leverage (from CADFit):** LLM proposes feature *structure*; a
+deterministic **numerical parameter-fit** pass snaps the dimensions to the mesh
+(least-squares / IoU on parameters). "LLM gets topology, math gets millimetres."
+Directly fixes the diff_case failure (guessed floor y=7.0 vs true 6.8). This is the
+next build — see below.

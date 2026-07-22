@@ -101,6 +101,24 @@ Fix the largest red regions, bump the `--tag` (iter1, iter2, …), and re-run st
 Target: max deviation and reverse both `< 0.1 mm`, valid closed solid, volume
 matching the mesh.
 
+### 5b. Snap dimensions with the parameter fitter
+
+Get the STRUCTURE right (the correct set/arrangement of features); you do NOT need
+to nail every dimension by eye. Once the shape is right but deviation is still
+~0.2–3 mm from imperfect numbers, let math finish it:
+
+```
+PYTHONPATH=src ./.venv/bin/python -m stlstep.compose fit <PART.stl> <WORKDIR> <WORKDIR>/attempt.py --out <OUT.step>
+```
+
+This treats every numeric literal in your script as a free parameter and optimises
+them (Powell) to minimise deviation to the mesh — snapping radii, positions,
+depths, and offsets to their true values (it fixed a plate+hole from 4.0 mm to
+0.014 mm, recovering an exact hole position from a 3.6 mm error). It writes
+`attempt_fitted.py` and verifies + exports it. If the structure is right, this is
+usually what takes you across the `< 0.1 mm` line. If it does NOT help much, your
+feature structure is wrong (a missing/extra feature) — go back to step 5, not fit.
+
 ### 6. Finish
 
 When `STATUS: PASS`, the `run --out` step has exported the STEP and written

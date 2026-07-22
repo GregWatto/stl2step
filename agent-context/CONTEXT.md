@@ -129,10 +129,16 @@ trust `occ_util.shape_to_mesh` for watertightness (it tessellates per-face).
 ## Key modules (added)
 
 - `compose.py` — the LLM composition path: `analyze` (dimensioned feature
-  report), `render_views`, `build_brief`, `run_candidate` (exec+verify+colormaps),
-  `compose_loop`, and composers (`AnthropicComposer`, `FileComposer`). CLI:
-  `python -m stlstep.compose {brief,run}` — the steps the `stl-draw` skill drives.
-- `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill.
+  report), `render_views`, `render_sections` (axial+transverse cross-sections —
+  the internal-geometry view), `build_brief`, `run_candidate` (exec+verify+two
+  colormaps), `compose_loop`, and composers (`AnthropicComposer`, `FileComposer`).
+  CLI: `python -m stlstep.compose {brief,run,fit}` — the steps the skill drives.
+- `fit.py` — numerical parameter fitting (CADFit-inspired): extract a script's
+  numeric literals and Powell-optimise them to minimise deviation to the mesh.
+  "LLM gets the structure; math gets the millimetres." Fixed a plate+hole from
+  4.0mm to 0.014mm, recovering an exact hole position from a 3.6mm error.
+- `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill
+  (recognizers → brief w/ cross-sections → compose → verify → refine → fit).
 
 ## Next step
 

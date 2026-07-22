@@ -670,6 +670,27 @@ def _cli_run(args) -> int:
     return 0 if passed else 1
 
 
+def _cli_fit(args) -> int:
+    from .ingest import load_and_repair
+    from . import fit as ft
+    with open(args.script) as fp:
+        script = fp.read()
+    ing = load_and_repair(args.stl)
+    os.makedirs(args.workdir, exist_ok=True)
+    res = ft.fit_parameters(script, ing.mesh, max_evals=args.max_evals)
+    print(f"fitted {res.n_params} numeric params in {res.n_evals} evals")
+    print(f"deviation before {res.dev_before:.3f} mm  ->  after "
+          f"{res.dev_after:.4f} mm")
+    fitted_path = os.path.join(args.workdir, "attempt_fitted.py")
+    with open(fitted_path, "w") as fp:
+        fp.write(res.script)
+    print(f"fitted script: {fitted_path}")
+    # verify + render + export the fitted version through the normal path
+    args.script = fitted_path
+    args.tag = args.tag + "_fit"
+    return _cli_run(args)
+
+
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser(
@@ -686,6 +707,15 @@ def main(argv=None) -> int:
     r.add_argument("--tol", type=float, default=0.1)
     r.add_argument("--out", default=None, help="export STEP here if it builds")
     r.set_defaults(fn=_cli_run)
+
+    f = sub.add_parser("fit", help="snap a script's dimensions to the mesh, then "
+                                   "verify (LLM gets structure, math gets mm)")
+    f.add_argument("stl"); f.add_argument("workdir"); f.add_argument("script")
+    f.add_argument("--tag", default="iter0")
+    f.add_argument("--tol", type=float, default=0.1)
+    f.add_argument("--max-evals", type=int, default=400)
+    f.add_argument("--out", default=None, help="export STEP here if it builds")
+    f.set_defaults(fn=_cli_fit)
 
     args = p.parse_args(argv)
     return args.fn(args)
