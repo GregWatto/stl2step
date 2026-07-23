@@ -218,14 +218,21 @@ def analyze(mesh: trimesh.Trimesh) -> dict:
         edge_treatments = {"fillets": [], "chamfers": []}
 
     lo, hi = mesh.bounds
+    try:
+        from .features import group_features
+        features = group_features(mesh, surfaces, (hi - lo).tolist())
+    except Exception:  # noqa: BLE001 — grouping is a convenience; never fatal
+        features = None
+
     return {
         "units": "mm",
         "bounding_box": {"min": _r(lo), "max": _r(hi), "size": _r(hi - lo)},
         "volume_mm3": (_r(float(mesh.volume), 1) if mesh.is_watertight else None),
         "watertight": bool(mesh.is_watertight),
         "n_triangles": int(len(mesh.faces)),
-        "surfaces": surfaces,
+        "features": features,
         "edge_treatments": edge_treatments,
+        "surfaces": surfaces,
         "deterministic_recognizers": recog,
     }
 
@@ -376,6 +383,13 @@ hide — cavity floor heights, counterbore steps, wall thicknesses, chamfers. Re
 exact depths and radii off them. Treat analytic fits in the analysis as hints, not
 truth: a large-radius sphere/torus is often a degenerate fit to a nearly-flat or
 stepped region — trust the cross-section over it.
+
+Start from `features` (the grouped view), not the raw `surfaces`: it gives named
+holes/counterbores/bosses with through-vs-blind, depths, and PATTERNS (a hole with
+count>1 and its positions_mm — model it with one `with Locations(*positions):`).
+`counterbore` means a two-diameter hole. `low_confidence_fits` lists analytic fits
+to IGNORE (a mis-fit sphere/torus). Fall back to `surfaces` only for anything
+`features` doesn't cover (e.g. pockets/slots — read those off the sections).
 
 Rules:
 - Output ONLY a Python code block: a build123d script. No prose outside it.
@@ -702,6 +716,20 @@ def _cli_brief(args) -> int:
         print(f"  sections : {brief.sections_png}   <- Read this (INTERNAL geometry)")
     print(f"  bbox {a['bounding_box']['size']} mm  min {a['bounding_box']['min']}  "
           f"volume {a['volume_mm3']} mm^3  watertight={a['watertight']}")
+    feats = a.get("features") or {}
+    if feats.get("holes") or feats.get("bosses"):
+        print("  features (grouped):")
+        for h in feats.get("holes", []):
+            cb = (f" +c'bore Ø{h['counterbore']['diameter_mm']}x"
+                  f"{h['counterbore']['depth_mm']}" if h.get("counterbore") else "")
+            thru = {True: "through", False: "blind", None: "?"}[h.get("through")]
+            print(f"    hole Ø{h['diameter_mm']} {thru} depth {h['depth_mm']} "
+                  f"x{h['count']} [{h['arrangement']}]{cb}")
+        for b in feats.get("bosses", []):
+            print(f"    boss Ø{b['diameter_mm']} h{b['depth_mm']} "
+                  f"x{b['count']} [{b['arrangement']}]")
+    if feats.get("low_confidence_fits"):
+        print(f"  low-confidence fits (distrust): {feats['low_confidence_fits']}")
     et = a.get("edge_treatments", {})
     if et.get("fillets") or et.get("chamfers"):
         fil = ", ".join(f"r~{f['radius_mm']}mm x{f['count']}"

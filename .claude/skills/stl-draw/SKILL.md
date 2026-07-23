@@ -50,10 +50,14 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.compose brief <PART.stl> <WORKDIR>
 ```
 
 Then **study the part**:
-- The command prints a dimensioned list of every surface (planes with normals;
-  cylinders labelled hole-vs-boss with Ø, axis, length, endpoints; cones; tori;
-  freeform patches), the bounding box, volume, and what the deterministic
-  recognizers saw.
+- Start from **`features`** (the grouped view): named holes / counterbores /
+  bosses with through-vs-blind, depths, and PATTERNS (a hole with `count`>1 and
+  its `positions_mm` — model with one `with Locations(*positions):`). `counterbore`
+  = two-diameter hole. **`low_confidence_fits`** lists analytic fits to IGNORE
+  (mis-fit sphere/torus). The raw dimensioned `surfaces` list (planes, cylinders,
+  cones, tori, freeform) is the fallback for whatever `features` doesn't cover
+  (pockets/slots — read those off the sections). The command also prints the bbox,
+  volume, and what the deterministic recognizers saw.
 - **Read the shaded render** with the Read tool: `<WORKDIR>/part_views.png` (four
   views). Confirm the arrangement of features matches the numbers.
 - **Read the cross-sections**: `<WORKDIR>/part_sections.png` (two axial + two
