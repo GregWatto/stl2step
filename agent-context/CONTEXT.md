@@ -78,6 +78,7 @@ Working end-to-end via one CLI. Per-fixture results:
 | bearing | draw:revolve | 0.08mm | races become arcs in the profile |
 | bracket | draw:prismatic | 0.04mm | plate + boss + blind pocket + 4 holes, 25 faces, 3 levels |
 | crossblock | llm (skill) | 0.02mm | block + boss + cross-axis hole + corner holes, 13 faces |
+| manifold | llm (skill) | 0.02mm | block + blind pocket + cross-bore + 4 counterbored holes; PASS first try |
 | battery_cover | BREP solid | exact | curved cover body → BREP fallback |
 | diff_case | BREP solid | exact | complex multi-feature → BREP fallback |
 
