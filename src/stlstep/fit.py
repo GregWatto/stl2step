@@ -76,22 +76,33 @@ def _build(script: str):
     return _extract_part(ns)
 
 
-def _deviation(part, mesh, pts_on_mesh):
-    """Symmetric p99 deviation: max of (mesh->model) and (model->mesh). The
-    objective MUST be deterministic across trials or the pattern search chases
-    sampling noise and stalls — so the forward pass reuses the fixed `pts_on_mesh`
-    and the reverse pass uses the model's tessellation VERTICES (deterministic per
-    part), not a fresh random surface sample."""
+def _distances(part, mesh, pts_on_mesh):
+    """Bidirectional point-surface distances (mesh->model, model->mesh), or None
+    if the part failed to build. Deterministic across trials (essential, or the
+    search chases sampling noise): the forward pass reuses the fixed
+    `pts_on_mesh`, the reverse pass uses the model's tessellation VERTICES."""
     from . import occ_util as ou
     if part is None or getattr(part, "volume", 0) <= 0:
-        return 1e6
+        return None
     rv, rf = ou.shape_to_mesh(part.wrapped, 0.03)   # fine enough to resolve <0.1mm
     if len(rf) == 0:
-        return 1e6
+        return None
     gen = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
     _, fwd, _ = trimesh.proximity.closest_point(gen, pts_on_mesh)
     _, rev, _ = trimesh.proximity.closest_point(mesh, np.asarray(rv))
-    return float(max(np.quantile(fwd, 0.99), np.quantile(rev, 0.99)))
+    return np.asarray(fwd), np.asarray(rev)
+
+
+def _rms(d) -> float:
+    """Smooth optimisation objective: every face contributes gradient, so
+    parameters affecting a non-worst face still get signal (a bare max-p99 only
+    'sees' the single worst face and stalls the rest)."""
+    return float(np.sqrt(np.mean(d[0] ** 2)) + np.sqrt(np.mean(d[1] ** 2)))
+
+
+def _p99(d) -> float:
+    """Reported/gated metric: symmetric worst-case (p99 each direction)."""
+    return float(max(np.quantile(d[0], 0.99), np.quantile(d[1], 0.99)))
 
 
 @dataclass
@@ -128,34 +139,44 @@ def fit_parameters(script: str, mesh: trimesh.Trimesh, *, samples: int = 2500,
 
     n_evals = [0]
 
-    def dev(vals) -> float:
-        n_evals[0] += 1
+    def dists(vals):
         try:
-            return _deviation(_build(render(script, params, vals)), mesh, pts)
-        except Exception:  # noqa: BLE001 — a bad parameter set just scores inf
-            return 1e6
+            return _distances(_build(render(script, params, vals)), mesh, pts)
+        except Exception:  # noqa: BLE001 — a bad parameter set is just infeasible
+            return None
+
+    def obj(vals) -> float:                     # RMS, the optimisation objective
+        n_evals[0] += 1
+        d = dists(vals)
+        return 1e6 if d is None else _rms(d)
+
+    def p99(vals) -> float:                     # reported/gated metric
+        d = dists(vals)
+        return 1e6 if d is None else _p99(d)
 
     x0 = np.array([p.value for p in params], dtype=float)
-    dev0 = dev(x0)
+    obj0 = obj(x0)
     if not len(x0):
-        return FitResult(script, dev0, dev0, 0, n_evals[0])
+        return FitResult(script, p99(x0), p99(x0), 0, n_evals[0])
 
-    x, _ = _powell(dev, x0, max_evals)
+    # Powell with a restart (resets its direction set — escapes shallow minima).
+    x, _ = _powell(obj, x0, max_evals // 2)
+    x, _ = _powell(obj, x, max_evals // 2)
 
-    # Revert-cleanup on true deviation: undo any drift that didn't earn its keep.
-    best = dev(x)
+    # Revert-cleanup on the RMS objective: undo drift that didn't earn its keep.
+    best = obj(x)
     for i in np.argsort(-np.abs(x - x0)):
         if x[i] == x0[i]:
             continue
         trial = x.copy(); trial[i] = x0[i]
-        f = dev(trial)
+        f = obj(trial)
         if f <= best + revert_tol:
             x, best = trial, f
 
-    if best >= dev0:                            # nothing helped -> structure is wrong
-        x, best = x0.copy(), dev0
+    if best >= obj0:                            # nothing helped -> structure is wrong
+        x = x0.copy()
     fitted = render(script, params, x, fmt="{:.6g}")
-    return FitResult(fitted, dev0, best, len(params), n_evals[0])
+    return FitResult(fitted, p99(x0), p99(x), len(params), n_evals[0])
 
 
 def _powell(objective, x0, max_evals):
