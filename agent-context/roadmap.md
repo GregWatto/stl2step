@@ -83,6 +83,27 @@ good at (which features, how they compose, is this render right).
   to catch qualitative failures the metric misses (the "donut" class) — the
   purest img2threejs transfer, still not built.
 
+## Corpus eval findings (2026-07, `eval/run_corpus.py`, n=80 low-LOD)
+
+First real measurement over the Fusion corpus (1477 mesh+STEP pairs). Directional
+(small n, low LOD), but grounds priorities:
+- **~30% draw deterministically** (extrude/revolve/prismatic) at **100% under
+  0.1mm** (median 1.4µm). Solid baseline; may be *under*-counted at low LOD.
+- Of the ~70% remainder: naive freeform-area split said 42% prismatic-ish / 58%
+  freeform-heavy — BUT the freeform-AREA metric **conflates organic with
+  prismatic-with-big-fillets** (e.g. a part with 14 cyls + 41 planes + 2 large
+  freeform regions reads 93% freeform; a 2710-plane assembly with 66 tori=fillets
+  reads 35% freeform). By STRUCTURE: ~half the remainder is really prismatic
+  (analytic-dominated), only ~15-25% of all parts are genuinely organic
+  (springs/caps/wings/sphere-dominated).
+- **Implication**: **feature-grouping is the highest-leverage next build** — the
+  largest addressable bucket is structurally-prismatic parts that don't draw yet,
+  many hidden in "freeform" because fillets/rounds read as freeform. Freeform
+  NURBS reconstruction is a real but secondary need (~1 in 5 parts).
+- Eval TODO: structure-based classifier (analytic-region fraction; treat tori/
+  small cylinders as fillets) + a medium-LOD run for sharper numbers.
+- `eval/scoreboard.json` is gitignored (contains private design names).
+
 ## Build-vs-buy reality (keep honest)
 
 Clean mesh→editable-CAD is solved commercially (Geomagic Design X, QuickSurface,

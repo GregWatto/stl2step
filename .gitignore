@@ -18,3 +18,7 @@ scratchpad/
 # root-level scratch / generated output
 /*.step
 /*_report/
+
+# corpus eval outputs contain private design names — keep local
+eval/scoreboard.json
+eval/*.local.json
