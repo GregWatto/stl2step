@@ -76,6 +76,13 @@ Write a build123d script to `<WORKDIR>/attempt.py`:
   or the rotational profile), then add features: holes as `Circle(...) ,
   mode=Mode.SUBTRACT` extrudes on the right face/plane, bosses as adds, fillets
   and chamfers with `fillet`/`chamfer` on the relevant edges.
+- **Fillets & chamfers**: the brief's `edge_treatments` flags approximate fillet
+  radii/counts (the segmenter hides them in freeform, so they're a hint — often
+  ~10% high). Fillets show as ARCS in the cross-sections, chamfers as short
+  DIAGONAL cuts — read the exact size there. Apply them AFTER the base, e.g.
+  `fillet(part.edges().filter_by(Axis.Z), radius=r)` (vertical edges) or
+  `chamfer(part.faces().sort_by(Axis.Z)[-1].edges(), length=w)` (top perimeter);
+  fillet before chamfer. The fitter (step 5b) snaps the radii.
 - A cylinder tagged `hole/bore (concave)` is a cut; `boss/shaft (convex)` is added
   material. Its axis + endpoints tell you the plane to sketch on and the depth.
 - Don't invent features that aren't in the analysis or visible in the render.

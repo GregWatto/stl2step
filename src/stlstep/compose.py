@@ -93,6 +93,64 @@ def _cylinder_desc(mesh, region):
     }
 
 
+def detect_edge_treatments(mesh, seg, neighbors) -> dict:
+    """Approximate fillet/chamfer detection from mesh curvature (the segmenter
+    grows THROUGH tangent fillets, so they hide inside freeform regions — this
+    recovers them independently). A HINT, not ground truth: fillet radii come out
+    ~10% high and chamfer widths aren't measured, so the composer confirms exact
+    values against the cross-sections. Fillets = connected bands of rounded convex
+    face-pairs that fit a small cylinder tightly; chamfers = flat bands whose
+    normal is oblique to every world axis (and which aren't fillet faces)."""
+    from .segment_rg import _fit_cylinder, _patch_points
+    from .ingest import connected_components
+    V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces)
+    fn = np.asarray(mesh.face_normals)
+    try:
+        ang = np.degrees(np.asarray(mesh.face_adjacency_angles))
+        conv = np.asarray(mesh.face_adjacency_convex)
+        pairs = np.asarray(mesh.face_adjacency)
+    except Exception:  # noqa: BLE001 — non-manifold mesh: no adjacency angles
+        return {"fillets": [], "chamfers": []}
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    analytic = {int(f) for r in seg.regions if r.kind != "plane"
+                and r.kind != "freeform" for f in r.face_ids}
+
+    rounded = (ang > 2) & (ang < 45) & conv
+    fillet_faces = {int(f) for f in np.unique(pairs[rounded])}
+    radii = []
+    for band in connected_components([f for f in fillet_faces if f not in analytic],
+                                     neighbors):
+        if len(band) < 10:
+            continue
+        fit = _fit_cylinder(*_patch_points(V, F, fn, band))
+        if fit is None:
+            continue
+        params, resid = fit
+        r = float(params["radius_mm"])
+        if 0.2 < r < 0.35 * diag and resid < 0.06 * r:   # tight resid = a real round
+            radii.append(r)
+
+    oblique = np.abs(fn).max(axis=1) < 0.94
+    chamfer_bands = [b for b in connected_components(
+        [int(f) for f in np.where(oblique)[0]
+         if int(f) not in analytic and int(f) not in fillet_faces], neighbors)
+        if len(b) >= 6]
+    return {"fillets": _cluster_radii(radii),
+            "chamfers": ([{"count": len(chamfer_bands)}] if chamfer_bands else [])}
+
+
+def _cluster_radii(radii: list[float]) -> list[dict]:
+    """Group nearby fillet radii (within 15%) -> [{radius_mm, count}]."""
+    out = []
+    for r in sorted(radii):
+        if out and r <= out[-1]["_sum"] / out[-1]["count"] * 1.15:
+            out[-1]["_sum"] += r; out[-1]["count"] += 1
+        else:
+            out.append({"_sum": r, "count": 1})
+    return [{"radius_mm": _r(g["_sum"] / g["count"]), "count": g["count"]}
+            for g in out]
+
+
 def analyze(mesh: trimesh.Trimesh) -> dict:
     """Segment the mesh and describe it as a dimensioned list of surfaces plus
     what the deterministic recognizers make of it. This is the factual half of
@@ -154,6 +212,11 @@ def analyze(mesh: trimesh.Trimesh) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
+    try:
+        edge_treatments = detect_edge_treatments(mesh, seg, neighbors)
+    except Exception:  # noqa: BLE001 — a hint; never fatal
+        edge_treatments = {"fillets": [], "chamfers": []}
+
     lo, hi = mesh.bounds
     return {
         "units": "mm",
@@ -162,6 +225,7 @@ def analyze(mesh: trimesh.Trimesh) -> dict:
         "watertight": bool(mesh.is_watertight),
         "n_triangles": int(len(mesh.faces)),
         "surfaces": surfaces,
+        "edge_treatments": edge_treatments,
         "deterministic_recognizers": recog,
     }
 
@@ -321,6 +385,13 @@ Rules:
   result overlays the mesh). Use the reported axes, radii, centres and extents.
 - Prefer the simplest faithful feature tree. Model holes as cuts, bosses as adds,
   fillets/chamfers with `fillet`/`chamfer` on the relevant edges.
+- EDGE TREATMENTS: fillets (rounded edges) read as ARCS in the cross-sections;
+  chamfers read as short DIAGONAL cuts. The analysis' `edge_treatments` gives
+  approximate fillet radii and counts (often ~10% high) — read the exact radius
+  off the section and let the fitter refine it. Apply them AFTER the base feature,
+  selecting edges e.g. `fillet(part.edges().filter_by(Axis.Z), radius=r)` for
+  vertical edges or `chamfer(part.faces().sort_by(Axis.Z)[-1].edges(), length=w)`
+  for a top perimeter. Order matters (fillet, then chamfer the remaining edges).
 - Don't invent features that aren't supported by the analysis or the views.
 - You will get back a deviation colormap and metrics; fix the largest errors and
   resubmit. Aim for max deviation under 0.1 mm.
@@ -631,6 +702,13 @@ def _cli_brief(args) -> int:
         print(f"  sections : {brief.sections_png}   <- Read this (INTERNAL geometry)")
     print(f"  bbox {a['bounding_box']['size']} mm  min {a['bounding_box']['min']}  "
           f"volume {a['volume_mm3']} mm^3  watertight={a['watertight']}")
+    et = a.get("edge_treatments", {})
+    if et.get("fillets") or et.get("chamfers"):
+        fil = ", ".join(f"r~{f['radius_mm']}mm x{f['count']}"
+                        for f in et.get("fillets", []))
+        chm = ", ".join(f"x{c['count']}" for c in et.get("chamfers", []))
+        print(f"  edge treatments (approx — confirm vs sections): "
+              f"fillets [{fil or 'none'}]  chamfers [{chm or 'none'}]")
     print(f"  deterministic recognizers: {a['deterministic_recognizers']}")
     print(f"  {len(a['surfaces'])} surfaces:")
     for s in a["surfaces"]:

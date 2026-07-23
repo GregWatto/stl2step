@@ -79,6 +79,7 @@ Working end-to-end via one CLI. Per-fixture results:
 | bracket | draw:prismatic | 0.04mm | plate + boss + blind pocket + 4 holes, 25 faces, 3 levels |
 | crossblock | llm (skill) | 0.02mm | block + boss + cross-axis hole + corner holes, 13 faces |
 | manifold | llm (skill) | 0.02mm | block + blind pocket + cross-bore + 4 counterbored holes; PASS first try |
+| filletblock | llm (skill) | 0.02mm | rounded-corner block + top chamfer + bore; fillet/chamfer PASS |
 | battery_cover | BREP solid | exact | curved cover body → BREP fallback |
 | diff_case | BREP solid | exact | complex multi-feature → BREP fallback |
 
@@ -135,9 +136,15 @@ trust `occ_util.shape_to_mesh` for watertightness (it tessellates per-face).
   colormaps), `compose_loop`, and composers (`AnthropicComposer`, `FileComposer`).
   CLI: `python -m stlstep.compose {brief,run,fit}` — the steps the skill drives.
 - `fit.py` — numerical parameter fitting (CADFit-inspired): extract a script's
-  numeric literals and Powell-optimise them to minimise deviation to the mesh.
-  "LLM gets the structure; math gets the millimetres." Fixed a plate+hole from
-  4.0mm to 0.014mm, recovering an exact hole position from a 3.6mm error.
+  numeric literals and Powell-optimise (RMS objective + restart) to minimise
+  deviation to the mesh. "LLM gets the structure; math gets the millimetres."
+  Fixed a plate+hole 4.0mm→0.014mm. **Anti-drift guard**: revert-cleanup snaps
+  any parameter back to the LLM's value unless moving it demonstrably helped, so a
+  structurally-incomplete part can't corrupt correct dimensions (and "fit didn't
+  help" = the structure is wrong). Snaps fillet/chamfer radii too.
+- `analyze()` also emits `edge_treatments`: approximate fillet radii + chamfer
+  counts from mesh curvature (segmenter grows through tangent fillets, so they
+  hide in freeform) — a HINT; the composer confirms exact sizes vs the sections.
 - `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill
   (recognizers → brief w/ cross-sections → compose → verify → refine → fit).
 
