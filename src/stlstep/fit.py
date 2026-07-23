@@ -104,11 +104,23 @@ class FitResult:
 
 
 def fit_parameters(script: str, mesh: trimesh.Trimesh, *, samples: int = 2500,
-                   max_evals: int = 400, seed: int = 0) -> FitResult:
-    """Snap the script's numeric literals to the mesh with an adaptive coordinate
-    pattern search. Only numbers that reduce deviation move; a trial that fails to
-    build (or bloats) scores infinity, so structural ints (counts) pin themselves.
-    Returns the fitted script and before/after deviation."""
+                   max_evals: int = 400, seed: int = 0,
+                   revert_tol: float = 0.02) -> FitResult:
+    """Snap the script's numeric literals to the mesh, trusting the LLM's values
+    unless the mesh clearly says otherwise.
+
+    Anti-drift is essential: when the remaining error is STRUCTURAL (a missing
+    feature), the deviation is flat w.r.t. most parameters, so the optimiser
+    wanders those flat directions and corrupts already-correct dimensions (it will
+    even prefer a globally-wrong model whose scalar deviation is marginally lower —
+    on diff_case it shrank a correct radius to spread a uniform 0.6mm error). The
+    guard is a REVERT-CLEANUP pass after optimisation: snap each parameter back to
+    its initial value `x0` unless moving it genuinely helped (true deviation stays
+    within `revert_tol`), largest drift first (that's where corruption hides).
+    A never-regress guard then returns the original script if nothing helped — which
+    is itself the signal that the STRUCTURE, not the numbers, is wrong. (An
+    in-objective Tikhonov penalty was tried and rejected: it degraded Powell's
+    convergence on the clean cases.)"""
     params = numeric_params(script)
     np.random.seed(seed)                        # fix the one-time forward sample
     pts, _ = trimesh.sample.sample_surface(mesh, samples)
@@ -116,7 +128,7 @@ def fit_parameters(script: str, mesh: trimesh.Trimesh, *, samples: int = 2500,
 
     n_evals = [0]
 
-    def objective(vals) -> float:
+    def dev(vals) -> float:
         n_evals[0] += 1
         try:
             return _deviation(_build(render(script, params, vals)), mesh, pts)
@@ -124,11 +136,25 @@ def fit_parameters(script: str, mesh: trimesh.Trimesh, *, samples: int = 2500,
             return 1e6
 
     x0 = np.array([p.value for p in params], dtype=float)
-    dev0 = objective(x0)
-    best_x, best = _powell(objective, x0, max_evals) if len(x0) else (x0, dev0)
-    if best >= dev0:                     # never regress
-        best_x, best = x0, dev0
-    fitted = render(script, params, best_x, fmt="{:.6g}")
+    dev0 = dev(x0)
+    if not len(x0):
+        return FitResult(script, dev0, dev0, 0, n_evals[0])
+
+    x, _ = _powell(dev, x0, max_evals)
+
+    # Revert-cleanup on true deviation: undo any drift that didn't earn its keep.
+    best = dev(x)
+    for i in np.argsort(-np.abs(x - x0)):
+        if x[i] == x0[i]:
+            continue
+        trial = x.copy(); trial[i] = x0[i]
+        f = dev(trial)
+        if f <= best + revert_tol:
+            x, best = trial, f
+
+    if best >= dev0:                            # nothing helped -> structure is wrong
+        x, best = x0.copy(), dev0
+    fitted = render(script, params, x, fmt="{:.6g}")
     return FitResult(fitted, dev0, best, len(params), n_evals[0])
 
 
