@@ -220,7 +220,7 @@ def analyze(mesh: trimesh.Trimesh) -> dict:
     lo, hi = mesh.bounds
     try:
         from .features import group_features
-        features = group_features(mesh, surfaces, (hi - lo).tolist())
+        features = group_features(mesh, seg, surfaces, (hi - lo).tolist())
     except Exception:  # noqa: BLE001 — grouping is a convenience; never fatal
         features = None
 
@@ -387,9 +387,12 @@ stepped region — trust the cross-section over it.
 Start from `features` (the grouped view), not the raw `surfaces`: it gives named
 holes/counterbores/bosses with through-vs-blind, depths, and PATTERNS (a hole with
 count>1 and its positions_mm — model it with one `with Locations(*positions):`).
-`counterbore` means a two-diameter hole. `low_confidence_fits` lists analytic fits
-to IGNORE (a mis-fit sphere/torus). Fall back to `surfaces` only for anything
-`features` doesn't cover (e.g. pockets/slots — read those off the sections).
+`counterbore` means a two-diameter hole. `pockets` gives recessed cavities (opening
+normal, floor level, depth, size) — sketch on the opening face and extrude(-depth,
+SUBTRACT), reading the exact outline off the sections. `low_confidence_fits` lists
+analytic fits to IGNORE (a mis-fit sphere/torus). `features` is best-effort — it
+may miss a pocket or a round/oblique one; fall back to `surfaces` + the sections
+for anything it doesn't list.
 
 Rules:
 - Output ONLY a Python code block: a build123d script. No prose outside it.
@@ -717,7 +720,7 @@ def _cli_brief(args) -> int:
     print(f"  bbox {a['bounding_box']['size']} mm  min {a['bounding_box']['min']}  "
           f"volume {a['volume_mm3']} mm^3  watertight={a['watertight']}")
     feats = a.get("features") or {}
-    if feats.get("holes") or feats.get("bosses"):
+    if feats.get("holes") or feats.get("bosses") or feats.get("pockets"):
         print("  features (grouped):")
         for h in feats.get("holes", []):
             cb = (f" +c'bore Ø{h['counterbore']['diameter_mm']}x"
@@ -728,6 +731,9 @@ def _cli_brief(args) -> int:
         for b in feats.get("bosses", []):
             print(f"    boss Ø{b['diameter_mm']} h{b['depth_mm']} "
                   f"x{b['count']} [{b['arrangement']}]")
+        for pk in feats.get("pockets", []):
+            print(f"    pocket {pk['size_mm']} depth {pk['depth_mm']} "
+                  f"floor@{pk['floor_level_mm']} normal {pk['opening_normal']}")
     if feats.get("low_confidence_fits"):
         print(f"  low-confidence fits (distrust): {feats['low_confidence_fits']}")
     et = a.get("edge_treatments", {})

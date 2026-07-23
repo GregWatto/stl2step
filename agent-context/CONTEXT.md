@@ -148,9 +148,11 @@ trust `occ_util.shape_to_mesh` for watertightness (it tessellates per-face).
 - `features.py` — feature grouping: collapses the surface-soup into named
   holes/counterbores/bosses (coaxial merge; through-vs-blind via mesh.contains;
   patterns: single/linear/circular/rectangular) and flags degenerate analytic
-  fits (the diff_case sphere → `low_confidence_fits`). Emitted as `features` in
-  the analysis; the composer starts here, not from raw `surfaces`. Pockets/slots
-  not grouped yet (read off the cross-sections). Corpus eval said this is the
+  fits (the diff_case sphere → `low_confidence_fits`), and detects prismatic
+  **pockets** (recessed floor + walls + void-to-surface checks; best-effort,
+  zero-false-positive-tuned so it may miss rather than mislead). Emitted as
+  `features`; the composer starts here, not from raw `surfaces`. Round/oblique
+  pockets + slots still read off the sections. Corpus eval said this is the
   highest-leverage lever (most non-drawn parts are structurally prismatic).
 - `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill
   (recognizers → brief w/ cross-sections → compose → verify → refine → fit).

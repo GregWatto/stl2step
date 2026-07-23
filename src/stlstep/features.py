@@ -41,7 +41,104 @@ def _perp_key(point, axis):
     return tuple(np.round(p - (p @ axis) * axis, 1))
 
 
-def group_features(mesh, surfaces, bbox_size) -> dict:
+def _pockets(mesh, seg, diag) -> list[dict]:
+    """Recessed enclosed cavities. A pocket needs three things a step or a solid
+    block lacks: a FLOOR (recessed planar face), an OPENING (a larger parallel
+    face further along the floor's outward normal), and VOID between them
+    (verified by a cross-section — robust without a watertight mesh), enclosed by
+    perpendicular WALLS on 3+ sides. Prismatic (planar-walled) pockets only; the
+    composer reads the exact outline off the sections."""
+    V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces)
+    fn = np.asarray(mesh.face_normals)
+    part_size = np.asarray(mesh.bounds[1]) - np.asarray(mesh.bounds[0])
+    P = []
+    for r in seg.regions:
+        if r.kind != "plane" or not r.face_ids:
+            continue
+        n = _unit(fn[r.face_ids].mean(axis=0))       # OUTWARD (seg normals have arbitrary sign)
+        pts = V[F[r.face_ids]].reshape(-1, 3)
+        P.append({"n": n, "off": float(np.median(pts @ n)), "pts": pts,
+                  "cen": pts.mean(axis=0)})
+
+    out = []
+    for fl in P:
+        n = fl["n"]
+        if np.max(np.abs(n)) < 0.9:                  # principal-axis floors only
+            continue
+        f = fl["off"]
+        e1 = _unit(np.cross(n, [1, 0, 0] if abs(n[0]) < 0.9 else [0, 1, 0]))
+        e2 = np.cross(n, e1)
+        fu, fv = fl["pts"] @ e1, fl["pts"] @ e2
+        ub, vb = (fu.min(), fu.max()), (fv.min(), fv.max())
+        mu, mv = 0.1 * (ub[1] - ub[0]) + 1e-6, 0.1 * (vb[1] - vb[0]) + 1e-6
+        # walls: perpendicular faces sitting on the floor (min coord ~ f), near
+        # the footprint — they rise from the floor to the opening (the rim).
+        walls_top, sides = [], set()
+        for w in P:
+            if abs(float(w["n"] @ n)) > 0.25:
+                continue
+            wt = w["pts"] @ n
+            if abs(float(wt.min()) - f) > 0.06 * diag or float(wt.max()) <= f + 0.02 * diag:
+                continue
+            wu, wv = float(np.mean(w["pts"] @ e1)), float(np.mean(w["pts"] @ e2))
+            if (ub[0] - mu <= wu <= ub[1] + mu) and (vb[0] - mv <= wv <= vb[1] + mv):
+                walls_top.append(float(wt.max()))
+                sides.add(tuple(np.round(w["n"], 1)))
+        if len(sides) < 3 or not walls_top:
+            continue
+        opening = float(np.median(walls_top))
+        depth = opening - f
+        # a floor much narrower than it is deep is really a WALL read side-on.
+        if depth < 0.02 * diag or min(ub[1] - ub[0], vb[1] - vb[0]) < 0.5 * depth:
+            continue
+        # the opening must be at the part's outer surface along +n OVER the
+        # footprint (a mis-read side wall's "opening" is an internal wall — the
+        # part continues past it; a real pocket opens to the outside). Local, not
+        # global, so a tall boss elsewhere doesn't disqualify a shallow pocket.
+        ua, va = V @ e1, V @ e2
+        mask = ((ua >= ub[0] - mu) & (ua <= ub[1] + mu)
+                & (va >= vb[0] - mv) & (va <= vb[1] + mv))
+        local_max = float((V[mask] @ n).max()) if mask.any() else opening
+        if opening < local_max - 0.05 * diag:
+            continue
+        # ...and the space must be void mid-depth AND right up at the opening.
+        if not (_is_void(mesh, fl["pts"], n, f + 0.5 * depth)
+                and _is_void(mesh, fl["pts"], n, opening - min(0.5, 0.2 * depth))):
+            continue
+        out.append({"opening_normal": [round(float(x), 3) for x in n],
+                    "opening_level_mm": round(opening, 2),
+                    "floor_level_mm": round(float(f), 2),
+                    "depth_mm": round(depth, 2),
+                    "size_mm": [round(float(ub[1] - ub[0]), 1),
+                                round(float(vb[1] - vb[0]), 1)]})
+    return out
+
+
+def _is_void(mesh, floor_pts, n, level) -> bool:
+    """True if the space over the floor at `level` (along n) is mostly NOT inside
+    material — the pocket void, vs a solid block or an open step read as solid.
+    Cross-section + point-in-polygon over MANY floor points (a single centroid can
+    fluke into a hole); robust to non-watertight meshes."""
+    import trimesh
+    from shapely.geometry import Point
+    try:
+        sec = mesh.section(plane_origin=(n * level).tolist(), plane_normal=n.tolist())
+        if sec is None:
+            return True                               # nothing there -> void
+        p2d, to_3d = sec.to_2D()
+        to_2d = np.linalg.inv(to_3d)
+        idx = np.linspace(0, len(floor_pts) - 1, min(20, len(floor_pts))).astype(int)
+        samp = floor_pts[idx]
+        samp = samp.mean(axis=0) + 0.6 * (samp - samp.mean(axis=0))   # shrink off walls
+        pts2 = trimesh.transformations.transform_points(samp, to_2d)[:, :2]
+        inside = sum(any(poly.contains(Point(p)) for poly in p2d.polygons_full)
+                     for p in pts2)
+        return inside < 0.5 * len(pts2)               # majority not in material
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def group_features(mesh, seg, surfaces, bbox_size) -> dict:
     diag = float(np.linalg.norm(bbox_size))
     cyls = []
     for s in surfaces:
@@ -69,13 +166,19 @@ def group_features(mesh, surfaces, bbox_size) -> dict:
         loc = _collapse_coaxial(cs, axis, mesh)
         (holes if kind == "hole" else bosses if kind == "boss" else holes).append(loc)
 
+    try:
+        pockets = _pockets(mesh, seg, diag)
+    except Exception:  # noqa: BLE001 — pockets are best-effort
+        pockets = []
+
     # 2) merge equal-signature holes/bosses into patterns
     features = {
         "holes": _patternize(holes),
         "bosses": _patternize(bosses),
+        "pockets": pockets,
         "low_confidence_fits": _degenerate(surfaces, diag),
-        "notes": ["pockets/slots are not grouped yet — read them off the "
-                  "cross-sections and the plane list"],
+        "notes": ["round/oblique pockets and slots aren't grouped — read those "
+                  "off the cross-sections and the plane list"],
     }
     return features
 
