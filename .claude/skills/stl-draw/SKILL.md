@@ -69,6 +69,30 @@ Then **study the part**:
   degenerate fit to a nearly-flat or stepped region — trust the cross-section.
 - Full detail is in `<WORKDIR>/analysis.json` if you need it.
 
+### 2b. Measure exact geometry with the probe (don't guess)
+
+When you need a real number the render/sections can't give you precisely — a
+feature's footprint at some height, whether a gap is solid or void, a revolve's
+radius profile — use the read-only `probe` tool instead of eyeballing or ad-hoc
+`python -c` snippets (those get gated on every run). All subcommands just print
+numbers; add `--json` for machine-readable output.
+
+```
+# overall bounds / volume / watertight
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe bbox <PART.stl>
+# loops (with X/Y/Z extents) at planes ⟂ an axis — footprints at heights
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe sections <PART.stl> --axis z --at 0.05,0.15,0.5 --frac
+# material extent in one plane, optionally inside a window (= form for negatives)
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --at 14.5 --window=-76,-54,0,20
+# radius vs axial position — reads off a revolve's silhouette + bore
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile <PART.stl> --axis x --n 40
+# inside/outside solid at points — through vs blind, void checks
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe point <PART.stl> 0,6,22 0,50,22
+```
+
+When a colormap later flags a region, come back here: probe that exact region's
+real geometry and match it, rather than iterating on a guessed shape.
+
 ### 3. Compose a build123d script (this is the "drawing")
 
 Write a build123d script to `<WORKDIR>/attempt.py`:
@@ -130,7 +154,27 @@ depths, and offsets to their true values (it fixed a plate+hole from 4.0 mm to
 usually what takes you across the `< 0.1 mm` line. If it does NOT help much, your
 feature structure is wrong (a missing/extra feature) — go back to step 5, not fit.
 
-### 6. Finish
+### 6. Final visual gate (structural check before you declare done)
+
+The colormap is the per-iteration judge; run this ONCE at the end as the
+human-equivalent "does it look like the part" check. It catches STRUCTURAL errors
+the colormap can under-report — a wrong cross-section (box vs hex), a flipped or
+mis-proportioned body — and it still works when the mesh is **non-watertight**
+(where the deviation/`contains` passes are unreliable).
+
+```
+PYTHONPATH=src ./.venv/bin/python -m stlstep.compose compare <PART.stl> <WORKDIR> <WORKDIR>/attempt.py --tag final
+```
+
+Read `<WORKDIR>/final_compare.png`: for each view it shows TARGET | CANDIDATE |
+overlay. In the overlay, **RED = material in the part you did NOT model (a missing
+feature); BLUE = material you added that isn't there**; grey = agreement (a 1-px
+edge fringe is filtered out, so any coloured *patch* is real). Do NOT rubber-stamp
+— actively LIST what differs per view and NAME the shape difference, then if a
+solid red/blue patch remains, go back to step 5 (measure it with `probe` first).
+Only when the overlay is essentially all-grey is the structure right.
+
+### 7. Finish
 
 When `STATUS: PASS`, the `run --out` step has exported the STEP and written
 `<WORKDIR>/feature_tree.py` — the editable feature recipe. Show the user the final
@@ -149,3 +193,8 @@ say so plainly and fall back to the BREP solid:
   engineer can actually edit in Fusion.
 - **Verify, don't assume** — every attempt is measured against the real mesh; keep
   a change only if the gate confirms it helped.
+- **Measure, don't guess** — when a colormap flags a region, extract that region's
+  real geometry with the `probe` tool (step 2b: `sections` / `slice` / `profile` /
+  `point`) and match the numbers. Do not eyeball a shape and iterate on guesses
+  (the vortex foot was wrong for 3 iterations that way; one `sections` probe — a
+  20.5 mm rectangle, not the 30 mm assumed — fixed it).

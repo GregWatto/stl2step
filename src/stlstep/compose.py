@@ -565,6 +565,129 @@ def _is_solid(shape) -> bool:
 
 
 # ----------------------------------------------------------------------------
+# Visual comparator — the FINAL gate / cross-model diagnostic.
+#
+# The deviation colormap stays the per-iteration judge (it pinpoints geometric
+# error precisely). This is the human-equivalent check the colormap can't give:
+# matched-camera renders of the target mesh next to the candidate, plus a
+# deterministic silhouette overlay that names *where the shapes differ* in image
+# space. It works even when the mesh is non-watertight (where the distance/
+# contains passes are unreliable), and it is the artifact to eyeball when a model
+# gets the STRUCTURE wrong (box-vs-hex, flipped, mis-proportioned) rather than the
+# dimensions. Because both meshes are rendered from identical cameras/limits, the
+# silhouettes are pixel-aligned and the XOR is meaningful.
+# ----------------------------------------------------------------------------
+
+# elev, azim, label — the same cameras render_views uses, so the comparison
+# matches the shaded brief renders.
+_CMP_VIEWS = [(22, -60, "iso 1"), (22, 45, "iso 2"),
+              (89, -90, "top -Z"), (5, 0, "front +X")]
+
+
+def _render_array(mesh, elev, azim, bounds, px=560):
+    """Shaded render of one mesh to an (H,W,3) float array on a WHITE background,
+    with a fixed camera and shared axis limits. White background makes the
+    silhouette trivial to extract (any non-white pixel is the part), and sharing
+    `bounds`/camera across meshes makes two such arrays pixel-comparable."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    tris = mesh.triangles
+    fn = np.asarray(mesh.face_normals)
+    light = np.array([0.4, 0.3, 0.85]); light /= np.linalg.norm(light)
+    shade = 0.35 + 0.65 * np.clip(np.abs(fn @ light), 0, 1)
+    base = np.array([0.45, 0.55, 0.68])
+    facecolors = np.clip(base[None, :] * shade[:, None], 0, 1)
+
+    lo, hi = np.asarray(bounds[0]), np.asarray(bounds[1])
+    ext = np.where(hi - lo > 1e-9, hi - lo, 1e-9)
+    dpi = 100
+    fig = plt.figure(figsize=(px / dpi, px / dpi), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1], projection="3d")
+    ax.add_collection3d(Poly3DCollection(tris, facecolors=facecolors,
+                                         edgecolors="none"))
+    ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
+    try:
+        ax.set_box_aspect(ext)
+    except Exception:  # noqa: BLE001
+        pass
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_axis_off()
+    fig.canvas.draw()
+    buf = np.asarray(fig.canvas.buffer_rgba()).astype(float) / 255.0
+    plt.close(fig)
+    return buf[:, :, :3]
+
+
+def _silhouette(img):
+    """Boolean mask of the part: any pixel that isn't (near-)white background."""
+    return img.min(axis=2) < 0.95
+
+
+def _erode(mask, iters=1):
+    """Binary erosion (4-neighbour) in pure numpy — shrinks a mask by `iters`
+    pixels. Used to strip the 1-2px anti-aliasing fringe from the silhouette-diff
+    so only genuine (thick) discrepancies are coloured, not rasterisation noise."""
+    m = mask
+    for _ in range(iters):
+        e = m.copy()
+        e[1:, :] &= m[:-1, :]
+        e[:-1, :] &= m[1:, :]
+        e[:, 1:] &= m[:, :-1]
+        e[:, :-1] &= m[:, 1:]
+        m = e
+    return m
+
+
+def render_comparison(target: trimesh.Trimesh, cand: trimesh.Trimesh,
+                      path: str, *, title: str = "") -> str:
+    """Matched-camera triptych per view: TARGET | CANDIDATE | silhouette overlay.
+    Overlay is deterministic: red where the target has material the candidate
+    lacks (a MISSING feature), blue where the candidate has material the target
+    lacks (EXTRA / wrong), grey where they agree. One PNG for the model to Read."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # union bounds so both meshes are framed identically
+    lo = np.minimum(target.bounds[0], cand.bounds[0])
+    hi = np.maximum(target.bounds[1], cand.bounds[1])
+    pad = 0.03 * (np.asarray(hi) - np.asarray(lo))
+    bounds = (np.asarray(lo) - pad, np.asarray(hi) + pad)
+
+    n = len(_CMP_VIEWS)
+    fig, axes = plt.subplots(n, 3, figsize=(11, 3.6 * n))
+    if n == 1:
+        axes = axes[None, :]
+    col_titles = ["TARGET (mesh)", "CANDIDATE (your model)",
+                  "overlay  (red=missing, blue=extra)"]
+    for r, (elev, azim, lab) in enumerate(_CMP_VIEWS):
+        timg = _render_array(target, elev, azim, bounds)
+        cimg = _render_array(cand, elev, azim, bounds)
+        tm, cm = _silhouette(timg), _silhouette(cimg)
+        ov = np.ones(timg.shape)
+        ov[tm | cm] = (0.72, 0.72, 0.72)            # either present -> agreement grey
+        # erode the difference regions to drop the AA fringe (keep thick patches)
+        ov[_erode(tm & ~cm)] = (0.85, 0.12, 0.12)   # target-only -> MISSING
+        ov[_erode(cm & ~tm)] = (0.12, 0.35, 0.88)   # candidate-only -> EXTRA
+        for c, im in enumerate((timg, cimg, ov)):
+            ax = axes[r, c]
+            ax.imshow(im); ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=10)
+            if c == 0:
+                ax.set_ylabel(lab, fontsize=9)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(path, dpi=95, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# ----------------------------------------------------------------------------
 # The generate -> verify -> refine loop.
 # ----------------------------------------------------------------------------
 
@@ -803,6 +926,35 @@ def _cli_fit(args) -> int:
     return _cli_run(args)
 
 
+def _cli_compare(args) -> int:
+    from .ingest import load_and_repair
+    from . import occ_util as ou
+    with open(args.script) as fp:
+        script = fp.read()
+    ing = load_and_repair(args.stl)
+    os.makedirs(args.workdir, exist_ok=True)
+    try:
+        part = exec_script(script)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print("CANDIDATE FAILED TO BUILD — nothing to compare:")
+        print("".join(traceback.format_exception_only(type(e), e)).strip())
+        print(traceback.format_exc(limit=3))
+        return 1
+    rv, rf = ou.shape_to_mesh(part.wrapped, 0.05)
+    cand = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+    out = os.path.join(args.workdir, f"{args.tag}_compare.png")
+    render_comparison(ing.mesh, cand, out,
+                      title=f"target vs candidate ({args.tag})")
+    print(f"comparison: {out}   <- Read this image")
+    print("Then LIST what differs between TARGET and CANDIDATE, per view. In the "
+          "overlay: RED = material in the part you did NOT model (a missing "
+          "feature); BLUE = material you added that isn't in the part. Grey = "
+          "agreement. Name the shape difference (e.g. 'foot is a hex prism, "
+          "modelled as a box'), then fix the largest discrepancy and re-run.")
+    return 0
+
+
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser(
@@ -828,6 +980,12 @@ def main(argv=None) -> int:
     f.add_argument("--max-evals", type=int, default=400)
     f.add_argument("--out", default=None, help="export STEP here if it builds")
     f.set_defaults(fn=_cli_fit)
+
+    c = sub.add_parser("compare", help="matched-view render of target vs candidate "
+                                       "+ silhouette diff (final gate / diagnostic)")
+    c.add_argument("stl"); c.add_argument("workdir"); c.add_argument("script")
+    c.add_argument("--tag", default="final")
+    c.set_defaults(fn=_cli_compare)
 
     args = p.parse_args(argv)
     return args.fn(args)
