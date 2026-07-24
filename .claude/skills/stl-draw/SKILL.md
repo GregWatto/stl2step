@@ -88,10 +88,29 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --a
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile <PART.stl> --axis x --n 40
 # inside/outside solid at points — through vs blind, void checks
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe point <PART.stl> 0,6,22 0,50,22
+# faceted vs curved: cluster face normals (few clusters = flat facets + fillets)
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe normals <PART.stl>
+# extract a cross-section as facets + fillet arcs and EMIT an extrude snippet
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile2d <PART.stl> --axis z --snippet
 ```
 
 When a colormap later flags a region, come back here: probe that exact region's
 real geometry and match it, rather than iterating on a guessed shape.
+
+**"Curves" are usually flat facets + fillets.** Before you approximate a curved
+region with boxes, run `normals`: if a handful of clusters cover ~90% of the area,
+the surface is flat facets meeting at angles, joined by small fillets — NOT a true
+curve. Then run `profile2d` on the relevant cross-section: it fits the section to
+straight facets + fillet arcs (and bores as circles) and prints a paste-ready
+`extrude` snippet in world coords. For a part that's a constant-section prism this
+reconstructs to <0.1 mm on its own (it rebuilt a 52-facet aluminium extrusion to
+0.012 mm); for a part that's a prism plus end features, paste the profile as the
+base body and add the caps/bosses/holes on top. `profile2d` sketches on the axis
+minimum and extrudes the full span by default — pass `--height` to cap it, and
+`--at`/`--frac` to pick which station's section to read (use a station where the
+cross-section is representative). NB it extracts the outer *silhouette*: for an
+open/thin-walled shell, don't blindly close + hollow it — check the front is
+really walled (a `point` probe) before adding a wall the part doesn't have.
 
 ### 3. Compose a build123d script (this is the "drawing")
 

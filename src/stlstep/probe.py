@@ -217,6 +217,140 @@ def cmd_point(m: trimesh.Trimesh, args) -> dict:
     return out
 
 
+def cmd_normals(m: trimesh.Trimesh, args) -> dict:
+    """Area-weighted clustering of face normals — is the part faceted (a few
+    discrete plane directions + thin fillet bands) or genuinely curved (normals
+    spread continuously)? Greedy: seed clusters from the largest faces, add a
+    face to a cluster if its normal is within `tol` degrees, else start a new
+    one. If a handful of clusters cover most of the area, the 'curves' are really
+    flat facets joined by fillets, and the right move is to recover those facets
+    (a recognition job), not to fit a spline (a modelling job)."""
+    fn = np.asarray(m.face_normals)
+    fa = np.asarray(m.area_faces)
+    order = np.argsort(-fa)
+    tol = np.cos(np.radians(args.tol))
+    seeds: list = []      # [seed_normal, area]
+    for i in order:
+        n, a = fn[i], fa[i]
+        for c in seeds:
+            if abs(float(np.dot(n, c[0]))) >= tol:   # abs: treat ±n as one plane
+                c[1] += a
+                break
+        else:
+            seeds.append([n.copy(), float(a)])
+    total = float(fa.sum())
+    seeds.sort(key=lambda c: -c[1])
+    cum, n90, n95 = 0.0, None, None
+    rows = []
+    for k, c in enumerate(seeds):
+        cum += c[1]
+        if n90 is None and cum >= 0.90 * total:
+            n90 = k + 1
+        if n95 is None and cum >= 0.95 * total:
+            n95 = k + 1
+        rows.append({"normal": [round(float(x), 3) for x in c[0]],
+                     "area_pct": 100 * c[1] / total,
+                     "cum_pct": 100 * cum / total})
+    big = sum(1 for c in seeds if c[1] >= 0.01 * total)
+    out = {"tol_deg": args.tol, "n_clusters": len(seeds),
+           "clusters_for_90pct": n90, "clusters_for_95pct": n95,
+           "clusters_over_1pct": big, "clusters": rows[:args.top]}
+    if not args.json:
+        print(f"area-weighted normal clusters (tol {args.tol}°): "
+              f"{len(seeds)} total, {big} carry >1% of area")
+        print(f"  {n90} clusters cover 90% of area, {n95} cover 95%")
+        print(f"  {'#':>2} {'area%':>7} {'cum%':>7}  normal")
+        for k, r in enumerate(out["clusters"]):
+            print(f"  {k+1:>2} {r['area_pct']:>7.2f} {r['cum_pct']:>7.2f}  "
+                  f"{_fmt(r['normal'])}")
+        verdict = ("FACETED (few plane directions -> recover facets + fillets)"
+                   if (n90 or 999) <= 14 else
+                   "genuinely CURVED (normals spread -> sweep/loft/revolve)")
+        print(f"  verdict: {verdict}")
+    return out
+
+
+def cmd_profile2d(m: trimesh.Trimesh, args) -> dict:
+    """Extract the cross-section at a station ⟂ an axis and fit it to clean
+    straight facets + fillet arcs (this is what a 'curve' that's really flat
+    faces + fillets decomposes into), then emit a paste-ready build123d extrude
+    snippet. Turns an under-recognised region into an exact, editable profile."""
+    from . import draw
+    ai = _axis(args.axis)
+    lo, hi = float(m.bounds[0][ai]), float(m.bounds[1][ai])
+    if args.at is None:
+        coord = 0.5 * (lo + hi)
+    elif args.frac:
+        coord = lo + args.at * (hi - lo)
+    else:
+        coord = args.at
+    polys = draw._section_polys(m, ai, coord)
+    if not polys:
+        raise SystemExit(f"no cross-section at {args.axis}={coord:.3f}")
+    height = args.height if args.height is not None else (hi - lo)
+
+    fitted, summary = [], []
+    for exterior, interiors in polys:
+        outer = draw.fit_loop(exterior, arcs=True)
+        holes = [draw.fit_loop(h, arcs=True) for h in interiors]
+        holes = [h for h in holes if h]
+        if not outer:
+            continue
+        fitted.append((outer, holes))
+
+        def _tally(segs):
+            lines = sum(1 for s in segs if s.kind == "line")
+            arcs = [s.radius for s in segs if s.kind == "arc"]
+            circ = [s.radius for s in segs if s.kind == "circle"]
+            return lines, arcs, circ
+        ol, oa, oc = _tally(outer)
+        summary.append({"loop": "outer", "facets": ol,
+                        "fillets": [round(r, 2) for r in oa],
+                        "circle_r": [round(r, 2) for r in oc]})
+        for k, h in enumerate(holes):
+            hl, ha, hc = _tally(h)
+            summary.append({"loop": f"hole{k+1}", "facets": hl,
+                            "fillets": [round(r, 2) for r in ha],
+                            "circle_r": [round(r, 2) for r in hc]})
+
+    if not fitted:
+        raise SystemExit("cross-section found but no loop could be fitted")
+
+    # emit the snippet — sketch on the base cap (axis min) so the extrude lands
+    # over the real part, not offset up from the section station
+    plane = draw._PLANE[ai]
+    base = lo if args.height is None else coord
+    L = ["from build123d import *", "",
+         f"# extruded profile: {args.axis}-section at {coord:.3f}, "
+         f"height {height:.3f} mm from {args.axis}={base:.3f}  (facets + fillet arcs)",
+         "with BuildPart() as part:",
+         f"    with BuildSketch(Plane.{plane}.offset({draw._fmt(base)})):"]
+    for outer, holes in fitted:
+        L.append("        # facet/fillet profile")
+        L.extend(draw._emit_loop_lines(outer, "", 8))
+        for h in holes:
+            L.append("        # hole")
+            L.extend(draw._emit_loop_lines(h, ", mode=Mode.SUBTRACT", 8))
+    L.append(f"    extrude(amount={draw._fmt(height)})")
+    snippet = "\n".join(L)
+
+    out = {"axis": args.axis, "at_mm": coord, "height_mm": height,
+           "n_polygons": len(fitted), "loops": summary, "snippet": snippet}
+    if not args.json:
+        print(f"{args.axis}-section at {coord:.3f}  ->  {len(fitted)} region(s), "
+              f"extrude height {height:.3f} mm")
+        for s in summary:
+            fil = (f"  fillets r={s['fillets']}" if s['fillets'] else "")
+            cir = (f"  CIRCLE r={s['circle_r']}" if s['circle_r'] else "")
+            print(f"    {s['loop']:>6}: {s['facets']} straight facet(s){fil}{cir}")
+        if args.snippet:
+            print("\n--- build123d snippet ---")
+            print(snippet)
+        else:
+            print("  (re-run with --snippet to print the build123d code)")
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="stlstep.probe",
@@ -254,6 +388,25 @@ def main(argv=None) -> int:
     pt.add_argument("stl"); pt.add_argument("points", nargs="+",
                                             help="one or more x,y,z")
     pt.set_defaults(fn=cmd_point)
+
+    nm = sub.add_parser("normals", help="cluster face normals: faceted vs curved")
+    nm.add_argument("stl"); nm.add_argument("--tol", type=float, default=10.0,
+                                            help="cluster angle tolerance, degrees")
+    nm.add_argument("--top", type=int, default=15, help="how many clusters to list")
+    nm.set_defaults(fn=cmd_normals)
+
+    p2 = sub.add_parser("profile2d", help="extract a cross-section as facets + "
+                                          "fillet arcs, emit an extrude snippet")
+    p2.add_argument("stl"); p2.add_argument("--axis", required=True)
+    p2.add_argument("--at", type=float, default=None,
+                    help="station coordinate (or fraction with --frac); default mid")
+    p2.add_argument("--frac", action="store_true",
+                    help="treat --at as a fraction 0..1 of the axis span")
+    p2.add_argument("--height", type=float, default=None,
+                    help="extrude height (default: full axis span)")
+    p2.add_argument("--snippet", action="store_true",
+                    help="print the paste-ready build123d code")
+    p2.set_defaults(fn=cmd_profile2d)
 
     args = p.parse_args(argv)
     m = _load(args.stl)
