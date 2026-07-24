@@ -162,16 +162,40 @@ trust `occ_util.shape_to_mesh` for watertightness (it tessellates per-face).
 - `.claude/skills/stl-draw/SKILL.md` — the keyless "Claude draws it" skill
   (recognizers → brief w/ cross-sections → compose → verify → refine → fit).
 
-## Next step
+## Current state (2026-07-24) — the full vision is built
 
-The composition path (C) works end-to-end: the `stl-draw` skill has Claude draw a
-part from the analysis + views, verify, and refine — proven on `crossblock`
-(cross-axis hole, 0.02mm, first pass) and the refine loop catches a dropped
-feature (9mm + wrong volume). Remaining polish:
-- **Fillets/chamfers** in the composer prompt + a fillet-edge detector in
-  `analyze` (currently fillets read as freeform/torus regions).
-- **Run the real refine loop live** on `battery_cover`/`diff_case` via the skill
-  (turn the last BREP-fallback parts into feature trees, or confirm freeform).
-- **Consider** an `auto` tier that invokes the skill/LLM before BREP (kept opt-in
-  for now to avoid surprise API cost; the skill is the keyless entry point).
-- Headless `--method llm` is wired but untested live (needs `anthropic` + key).
+Every piece of "agent takes STL → STEP, checks, iterates to accuracy" exists:
+deterministic draw (extrude/revolve/prismatic) + LLM composition loop + BREP
+fallback, unified by the **autonomous driver** (`--method full`, escalation trail)
+and the keyless **`stl-draw` skill**. Recognition is strong: `features.py`
+(holes/counterbores/bosses/patterns/pockets + degenerate flags), `edge_treatments`
+(fillet/chamfer hints), cross-section perception, and the `fit.py` dimension
+snapper. Corpus eval (`eval/run_corpus.py`, n=80): ~30% draw deterministically at
+100% <0.1mm; most of the remainder is structurally prismatic (feature-grouping is
+the lever). **The stl-draw skill is now ALSO global** (`~/.claude/skills/stl-draw/`
+— a launcher that cd's into the repo) so it works from any session.
+
+### Live tests on real downloaded parts (the skill in action)
+- **Mold-bottom.stl** → clean PASS **0.018mm**: base plate + 2 posts + 4
+  rounded-top corner pins. (First attempt 0.16mm; fitter didn't help → that signal
+  said the pin SHAPE was off; measured the pin profile r=2.0 cyl+hemisphere → PASS.)
+- **vortex.stl** (threaded vortex tube, 159mm, non-watertight, BREP failed) → drawn
+  as a stepped **revolve + through-bore + mounting foot** to ~2.9mm. The body/head/
+  bore/tip are near-exact; residual is the two end faces (~3mm) + thread crests
+  (~1mm, smoothed). **Process lesson (see lessons.md):** foot was wrong for 3
+  iterations because it was GUESSED (box→hex) — the real bug was foot LENGTH
+  (overhang), fixed in one shot by MEASURING the footprint. Don't guess; don't stop
+  with red on the colormap.
+
+## Next step (pick up here after compact)
+
+- **Finish vortex** (offered, user deciding): measure+fix the tip orifice & head
+  end-cap (~3mm residual), and add REAL threads via build123d `IsoThread` (from a
+  spec) to the head bore + inlet instead of smoothing. `/tmp/vortex_draw/attempt.py`
+  is the current script; STEP at `~/Downloads/vortex.step`.
+- **Vision-in-the-loop gate** (discussed): render candidate-vs-target from matched
+  angles as a *final* check / for ambiguous geometry — NOT the per-iteration judge
+  (the deviation colormap is better at pinpointing errors). Roadmap item, unbuilt.
+- Smaller: pockets miss on `manifold` (safe miss); packaging (`pip install -e .`);
+  freeform/NURBS path (~1-in-5 parts); headless `--method llm` untested live
+  (needs `anthropic` + key — user deprioritized, prefers the in-session skill).

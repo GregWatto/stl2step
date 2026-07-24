@@ -94,3 +94,44 @@ parts (most of them), draw it; only fall back to BREP for genuinely freeform.
   fine (a strict global self-intersection check); a `ShapeFix` pass usually
   clears it. Negative `solid_volume` = inward orientation → `.Reversed()`.
 - OCCT leaks process-wide state on big batch runs; v1 needed subprocess-per-part.
+
+## Composing complex parts by hand (the skill loop) — process lessons
+
+Hard-won on the live `vortex.stl` test (a threaded vortex tube), where the same
+mistake was made twice:
+
+- **MEASURE the region the colormap flags — never GUESS its shape.** The revolve
+  body was near-exact because its radial profile was *extracted* from the mesh and
+  matched. The mounting foot was wrong for 3 iterations because it was *eyeballed*
+  (box → wider box → hexagon) from a couple of width samples. One measurement of
+  the actual footprint (a 20.5×21mm rectangle) fixed it immediately. When a region
+  is red, section it / slice it horizontally / extract its profile, then match.
+- **Read the colormap for the RIGHT cause.** The foot's persistent ~8mm reverse
+  spike was its LENGTH (it overhung ~10mm under the neck), not its cross-section
+  shape — but the error appeared "near the foot" so it got misattributed to shape.
+  Check extent/position before fiddling with shape.
+- **Don't stop while a red block is on screen.** Twice the loop was halted with a
+  premature "good enough, concept proven" — leaving a glaring, fixable fault. The
+  deviation colormap literally shows where to look; keep going until it's down or
+  the residual is provably inherent (thread crests, faceting).
+- **Decompose a complex part into primitives.** vortex became tractable once split
+  into revolve(outer silhouette) + revolve-subtract(bore profile) + foot + inlet —
+  not attacked as one blob. Extract the radial profile r_outer(X), r_bore(X) for
+  anything shaft/tube-like; revolve about the found axis (here X @ y=6.06,z=25.01).
+- **Threads: model as a spec, not a surface fit.** For a "decent interpretation"
+  smooth a threaded region to a plain cylinder at its effective Ø; for a faithful
+  one, add build123d `IsoThread`/`TrapezoidalThread` from the thread spec. Never
+  try to reverse the helix geometrically (even commercial tools use thread libs).
+- **The `fit.py` "didn't help" signal is diagnostic.** On Mold-bottom the fitter
+  didn't move 0.16mm → that meant the pin STRUCTURE (shape) was wrong, not the
+  numbers. Measured the pin profile (r2.0 cylinder + hemisphere) → 0.018mm PASS.
+
+## How the loop "judges" (vs img2threejs)
+
+img2threejs judges perceptually: render the generated scene → a vision model
+compares the screenshot to the target IMAGE → iterate. Our target is a MESH, so we
+judge GEOMETRICALLY: surface-to-surface deviation + the two colormaps (missing =
+mesh coloured by dist to model; extra = model coloured by dist to mesh). The
+colormap is the better *per-iteration* judge — it pinpoints WHERE and by how much.
+A vision gate (render candidate vs target from matched angles) is best reserved as
+a FINAL check or for genuinely ambiguous geometry — it's not built yet.
