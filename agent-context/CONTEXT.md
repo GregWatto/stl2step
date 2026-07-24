@@ -61,10 +61,15 @@ backend (`convert --method llm`).
 watertight solid with analytic surfaces and clean intersection-curve edges.
 Region-by-region fallback (clean → polyline merge → NURBS drape → facet), guarded.
 
-**Dispatcher** — `convert.py` `method="auto"` (default): draw a feature model
-(A); if the part isn't drawable, fall back to the `solid` BREP method (B). The
-LLM path (C) is opt-in via the `stl-draw` skill or `--method llm` (avoids
-surprise API cost in `auto`).
+**Dispatcher** — `convert.py`:
+- `method="auto"` (default): draw a feature model (A); else BREP `solid` (B).
+- `method="full"` — the **autonomous driver**: tier 1 deterministic draw → tier 2
+  LLM compose_loop (if a composer/API key is available) → tier 3 BREP fallback,
+  gated to `dev_tol`, with a visible `escalation` trail
+  (e.g. `draw:miss -> llm:hit(2it)` or `... -> brep:fallback`). Without a key,
+  tier 2 is skipped and it degrades to `auto`. The **`stl-draw` skill** is the
+  keyless in-session equivalent (Claude is the tier-2 composer).
+- `method="llm"` — just the LLM loop (needs a composer/key).
 
 ## Current state (all committed, latest 31464a3)
 

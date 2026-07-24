@@ -32,19 +32,48 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
             detector_kwargs: dict | None = None) -> dict:
     t0 = time.time()
     ing = load_and_repair(stl_path)
+    escalation: list[str] = []
 
-    # 'auto'/'draw': try to reconstruct as a parametric feature model first.
-    if method in ("auto", "draw"):
+    # 'auto'/'draw'/'full': try to reconstruct as a parametric feature model first.
+    if method in ("auto", "draw", "full"):
         from . import draw as dw
         res = dw.draw(ing.mesh)
+        escalation.append("draw:" + ("hit" if res is not None else "miss"))
         if res is not None:
-            return _finish_draw(res, ing, stl_path, step_path, report_dir, t0)
+            out = _finish_draw(res, ing, stl_path, step_path, report_dir, t0)
+            out["escalation"] = escalation
+            return out
         if method == "draw":
             return {"input": stl_path, "output": step_path, "method": "draw",
                     "drawn": False,
                     "note": "not a single-feature (extrude/revolve) part",
                     "elapsed_s": round(time.time() - t0, 2)}
-        method = "solid"   # auto: fall back to the BREP path
+
+        # 'full' — the autonomous driver: escalate to the LLM composition loop
+        # before falling back to BREP.
+        if method == "full":
+            from . import compose as co
+            workdir = report_dir or os.path.join(
+                os.path.dirname(os.path.abspath(step_path)) or ".", "_llm_work")
+            comp = composer
+            if comp is None:
+                try:
+                    comp = co.AnthropicComposer(model=llm_model)
+                except Exception:  # noqa: BLE001 — no SDK/key: skip the LLM tier
+                    comp = None
+            if comp is None:
+                escalation.append("llm:unavailable")
+            else:
+                cres = co.compose_loop(ing.mesh, comp, workdir,
+                                       max_iters=llm_iters, dev_tol=p95_threshold_mm)
+                escalation.append(f"llm:{'hit' if cres.passed else 'miss'}"
+                                  f"({len(cres.attempts)}it)")
+                if cres.passed:
+                    out = _finish_compose(cres, ing, stl_path, step_path, workdir, t0)
+                    out["escalation"] = escalation
+                    return out
+
+        method = "solid"   # auto/full: fall back to the BREP path
 
     # 'llm': the LLM composes the build123d feature script; execute + verify +
     # refine until it meets tolerance, then export the best candidate.
@@ -83,11 +112,14 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
                     p95_threshold_mm=p95_threshold_mm,
                     render_path=render_path)
 
+    if method == "solid" and escalation:
+        escalation.append("brep:fallback")
     result = {
         "input": stl_path,
         "output": step_path,
         "step_written": ou_ok,
         "method": method,
+        "escalation": escalation or None,
         "elapsed_s": round(time.time() - t0, 2),
         "segmentation": {
             "regions": len(seg.regions),
@@ -200,10 +232,10 @@ def main(argv=None) -> int:
     p.add_argument("stl_path")
     p.add_argument("-o", "--output", required=True, help="output .step path")
     p.add_argument("--method", default="auto",
-                   choices=["auto", "draw", "llm", "facets", "merged", "shell",
-                            "solid"],
-                   help="auto = draw a feature model, else BREP solid (default); "
-                        "llm = LLM composes the feature script")
+                   choices=["auto", "draw", "llm", "full", "facets", "merged",
+                            "shell", "solid"],
+                   help="auto = draw else BREP (default); llm = LLM composes; "
+                        "full = autonomous driver (draw -> LLM -> BREP)")
     p.add_argument("--segmenter", default="rg", choices=["rg", "ransac"],
                    help="rg = region-growing (default), ransac = old detector")
     p.add_argument("--report", default=None, help="report dir (JSON + PNG)")
@@ -225,6 +257,8 @@ def main(argv=None) -> int:
         detector_kwargs={"n_samples": args.samples},
     )
     name = os.path.basename(args.stl_path)
+    if result.get("escalation"):
+        print(f"[{name}] escalation: {' -> '.join(result['escalation'])}")
 
     if result.get("method") == "llm":
         if not result.get("drawn"):
