@@ -109,9 +109,14 @@ reconstructs to <0.1 mm on its own (it rebuilt a 52-facet aluminium extrusion to
 base body and add the caps/bosses/holes on top. `profile2d` sketches on the axis
 minimum and extrudes the full span by default — pass `--height` to cap it, and
 `--at`/`--frac` to pick which station's section to read (use a station where the
-cross-section is representative). NB it extracts the outer *silhouette*: for an
-open/thin-walled shell, don't blindly close + hollow it — check the front is
-really walled (a `point` probe) before adding a wall the part doesn't have.
+cross-section is representative). Thin-walled OPEN shells now work directly: the
+section fit preserves a thin wall band (it no longer collapses to a filled
+silhouette), so `profile2d` on a thin-wall part gives the actual walls with the
+open side intact — extrude it as-is (a constant-section open channel / tray even
+reconstructs automatically via `convert`). For a multi-level open shell (a base
+plate + thin walls of differing height, like a corner holder), take a section in
+each level — the thin-wall band, the base plate, the post — and stack the
+extrudes; each `point`-check the front to confirm which sides are walled.
 
 ### 3. Compose a build123d script (this is the "drawing")
 

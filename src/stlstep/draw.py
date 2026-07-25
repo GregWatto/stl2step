@@ -709,6 +709,20 @@ def fit_loop(pts, *, arcs=True, corner_deg=18.0, arc_min_pts=4, line_tol=0.02,
         idx = [i % n for i in range(a, b + 1)]
         segs.extend(_curvature_fit(P[idx], arc_min_pts, line_tol,
                                    arc_resid_frac, arcs))
+
+    # Thin-band guard. The corner→segment logic assumes a simple filled outline;
+    # given a THIN out-and-back band (an open-shell wall section, whose inner
+    # return path hugs the outer one) it "cuts across" and fills the silhouette.
+    # Detect that by a gross change in enclosed area and instead keep a
+    # shape-preserving simplified polyline, so thin walls survive intact.
+    raw_area = _poly_area(P)
+    if raw_area > 1e-6 and len(segs) >= 3:
+        fit_area = _poly_area([s.p0 for s in segs])
+        if abs(fit_area - raw_area) > 0.25 * raw_area:
+            diag = float(np.hypot(*(P.max(0) - P.min(0))))
+            simp = _rdp_closed(P, max(0.15, 3e-3 * diag))
+            if len(simp) >= 3:
+                return _polyline_segs(np.vstack([simp, simp[0]]))
     return segs
 
 
@@ -943,6 +957,42 @@ def _max_sagitta(run):
 
 def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def _rdp_closed(P, eps):
+    """Douglas-Peucker simplification of a CLOSED loop, preserving shape to
+    within `eps`. Anchors at the point farthest from the centroid (a definite
+    corner) so the open-polyline pass has good, stable endpoints."""
+    P = np.asarray(P, dtype=float)
+    if len(P) < 4:
+        return P
+    c = P.mean(axis=0)
+    start = int(np.argmax(((P - c) ** 2).sum(axis=1)))
+    Q = np.roll(P, -start, axis=0)
+    Q = np.vstack([Q, Q[0]])            # open polyline start..start
+    keep = np.zeros(len(Q), dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(Q) - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b <= a + 1:
+            continue
+        seg = Q[b] - Q[a]
+        L = float(np.hypot(seg[0], seg[1]))
+        pts = Q[a + 1:b]
+        if L < 1e-12:
+            d = np.hypot(pts[:, 0] - Q[a][0], pts[:, 1] - Q[a][1])
+        else:
+            nrm = np.array([-seg[1], seg[0]]) / L
+            d = np.abs((pts - Q[a]) @ nrm)
+        if len(d) == 0:
+            continue
+        m = int(np.argmax(d))
+        if d[m] > eps:
+            k = a + 1 + m
+            keep[k] = True
+            stack.append((a, k)); stack.append((k, b))
+    return Q[keep][:-1]                  # drop the duplicated closing point
 
 
 def _dedup(P, tol=1e-2):
