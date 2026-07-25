@@ -351,6 +351,40 @@ def cmd_profile2d(m: trimesh.Trimesh, args) -> dict:
     return out
 
 
+def cmd_slicepics(m: trimesh.Trimesh, args) -> dict:
+    """Render section DRAWINGS at requested coordinates (or a dense range) — the
+    visual zoom lens for a region the default 4-plane brief render steps over.
+    Filled grey, internal voids white: internal structure is directly visible.
+    Also prints each slice's loop extents (the numbers) like `sections`."""
+    from . import featurecheck as fc
+    ai = _axis(args.axis)
+    lo, hi = float(m.bounds[0][ai]), float(m.bounds[1][ai])
+    if args.at:
+        coords = [float(x) for x in args.at.split(",") if x.strip() != ""]
+        if args.frac:
+            coords = [lo + f * (hi - lo) for f in coords]
+    elif args.range:
+        r = [float(x) for x in args.range.split(",")]
+        if len(r) != 2:
+            raise SystemExit("--range needs lo,hi (use = form for negatives)")
+        coords = np.linspace(r[0], r[1], max(2, args.n)).tolist()
+    else:
+        raise SystemExit("give --at c1,c2,... or --range lo,hi (with --n)")
+    out_png = args.out or "slicepics.png"
+    fc.render_slice_strip(m, ai, coords, out_png)
+    result = {"axis": args.axis, "coords": [round(c, 3) for c in coords],
+              "image": out_png}
+    if not args.json:
+        # numeric summary per slice, same shape as `sections`
+        class _A:  # reuse cmd_sections' printer via a tiny shim
+            axis, frac, json = args.axis, False, args.json
+            at = ",".join(f"{c}" for c in coords)
+        cmd_sections(m, _A)
+        print(f"slice drawings: {out_png}   <- Read this image "
+              f"(grey=material, white=internal void)")
+    return result
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="stlstep.probe",
@@ -407,6 +441,18 @@ def main(argv=None) -> int:
     p2.add_argument("--snippet", action="store_true",
                     help="print the paste-ready build123d code")
     p2.set_defaults(fn=cmd_profile2d)
+
+    sp = sub.add_parser("slicepics", help="render section drawings at chosen "
+                                          "coords/range — visual zoom lens")
+    sp.add_argument("stl"); sp.add_argument("--axis", required=True)
+    sp.add_argument("--at", default=None,
+                    help="comma list of coordinates (or fractions with --frac)")
+    sp.add_argument("--frac", action="store_true")
+    sp.add_argument("--range", default=None,
+                    help="lo,hi band to slice densely (= form for negatives)")
+    sp.add_argument("--n", type=int, default=8, help="slices across --range")
+    sp.add_argument("--out", default=None, help="output PNG path")
+    sp.set_defaults(fn=cmd_slicepics)
 
     args = p.parse_args(argv)
     m = _load(args.stl)

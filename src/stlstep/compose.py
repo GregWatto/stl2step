@@ -1056,6 +1056,48 @@ def _cli_compare(args) -> int:
     return 0
 
 
+def _cli_slices(args) -> int:
+    """Targeted occupancy re-analysis: densely slice a REQUESTED band and diff
+    target vs candidate slice-by-slice, rendering every slice. The zoom lens for
+    a region the uniform verify pass flagged (or stepped over)."""
+    from .ingest import load_and_repair
+    from . import featurecheck as fc
+    from . import occ_util as ou
+    with open(args.script) as fp:
+        script = fp.read()
+    ing = load_and_repair(args.stl)
+    os.makedirs(args.workdir, exist_ok=True)
+    try:
+        part = exec_script(script)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print("CANDIDATE FAILED TO BUILD — nothing to compare:")
+        print("".join(traceback.format_exception_only(type(e), e)).strip())
+        return 1
+    rv, rf = ou.shape_to_mesh(part.wrapped, 0.1)
+    cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+
+    ai = {"x": 0, "y": 1, "z": 2}.get(args.axis)
+    if ai is None:
+        raise SystemExit(f"--axis must be x/y/z, got {args.axis!r}")
+    r = [float(x) for x in args.range.split(",")]
+    if len(r) != 2:
+        raise SystemExit("--range needs lo,hi (use --range=-76,-55 for negatives)")
+    recs = fc.zoom_occupancy(ing.mesh, cg, ai, r[0], r[1], n=args.n)
+    for rec in recs:
+        loc = (f"  region {rec['region_uv_bounds']}"
+               if rec.get("region_uv_bounds") else "")
+        print(f"  {rec['axis']}={rec['at_mm']}  IoU {rec['iou']}  "
+              f"target {rec['target_mm2']}mm^2 cand {rec['cand_mm2']}mm^2  "
+              f"missing {rec['missing_mm2']}  extra {rec['extra_mm2']}{loc}")
+    out_png = os.path.join(args.workdir, f"{args.tag}_slices_zoom.png")
+    coords = [rec["at_mm"] for rec in recs]
+    fc.render_slice_strip(ing.mesh, ai, coords, out_png, cand_mesh=cg)
+    print(f"zoom report: {out_png}   <- Read this image (grey=match, "
+          f"red=missing, blue=extra)")
+    return 0
+
+
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser(
@@ -1088,6 +1130,16 @@ def main(argv=None) -> int:
     c.add_argument("stl"); c.add_argument("workdir"); c.add_argument("script")
     c.add_argument("--tag", default="final")
     c.set_defaults(fn=_cli_compare)
+
+    z = sub.add_parser("slices", help="ZOOM: densely slice a chosen band and "
+                                      "diff target vs candidate per slice")
+    z.add_argument("stl"); z.add_argument("workdir"); z.add_argument("script")
+    z.add_argument("--axis", required=True, help="x, y, or z")
+    z.add_argument("--range", required=True,
+                   help="lo,hi band (use --range=-76,-55 for negatives)")
+    z.add_argument("--n", type=int, default=12, help="slices across the band")
+    z.add_argument("--tag", default="zoom")
+    z.set_defaults(fn=_cli_slices)
 
     args = p.parse_args(argv)
     return args.fn(args)

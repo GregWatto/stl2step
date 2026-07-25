@@ -107,6 +107,10 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --a
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile <PART.stl> --axis x --n 40
 # inside/outside solid at points — through vs blind, void checks
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe point <PART.stl> 0,6,22 0,50,22
+# ZOOM: render section DRAWINGS at chosen coords or densely across a band —
+# grey=material, white=INTERNAL VOID. Use on any band the 4 default sections
+# step over (a head, a cavity zone, wherever INTERNAL CAVITY was flagged).
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slicepics <PART.stl> --axis x --range=-76,-55 --n 8 --out <WORKDIR>/zoom.png
 # faceted vs curved: cluster face normals (few clusters = flat facets + fillets)
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe normals <PART.stl>
 # extract a cross-section as facets + fillet arcs and EMIT an extrude snippet
@@ -198,6 +202,20 @@ red=missing material, blue=extra). **Read that image**; fix the worst slices
 first, using `probe sections --axis <a> --at=<coord>` at exactly those
 coordinates to read the true geometry there. PASS requires missing AND extra
 under 3% of the part's volume.
+
+**Zoom on demand.** The uniform pass samples ~40 stations per axis and can step
+over a small feature; when it flags a band (or you suspect one), request a dense
+targeted re-analysis:
+```
+# target vs YOUR MODEL, slice-by-slice across the band, every slice rendered:
+PYTHONPATH=src ./.venv/bin/python -m stlstep.compose slices <PART.stl> <WORKDIR> <WORKDIR>/attempt.py --axis x --range=-76,-55 --n 8
+# target only (what IS the true internal structure here?):
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slicepics <PART.stl> --axis x --range=-76,-55 --n 8 --out <WORKDIR>/zoom.png
+```
+On a threaded vortex head this revealed, per station: the swirl-vane end face,
+an annular ring chamber around the bore, and internal thread reliefs — none of
+which appear in the default 4 sections. Read the zoom image, then model exactly
+what each station shows.
 
 **Deviation cannot see small features, so `run` also prints a feature check.**
 Because a missing fillet/hole/chamfer barely moves the distance metric, the verify

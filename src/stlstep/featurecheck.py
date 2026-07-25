@@ -355,6 +355,115 @@ def render_slice_report(target_mesh, cand_mesh, occ: dict, path: str) -> str | N
     return path
 
 
+def zoom_occupancy(target_mesh, cand_mesh, axis: int, lo: float, hi: float,
+                   n: int = 12) -> list[dict]:
+    """Targeted occupancy re-analysis: slice a REQUESTED band densely and diff
+    target vs candidate per slice. This is the agent's zoom lens for a region the
+    uniform pass flagged (or stepped over) — same measures as slice_occupancy
+    (IoU, missing/extra area, divergent-region bounds) but at coordinates and
+    density the agent chooses."""
+    names = "xyz"
+    out = []
+    coords = np.linspace(lo, hi, max(2, n))
+    for c in coords:
+        mr = _slice_region(target_mesh, axis, float(c))
+        cr = _slice_region(cand_mesh, axis, float(c))
+        ma = float(mr.area) if mr is not None else 0.0
+        ca = float(cr.area) if cr is not None else 0.0
+        rec = {"axis": names[axis], "at_mm": round(float(c), 3),
+               "target_mm2": round(ma, 1), "cand_mm2": round(ca, 1)}
+        if mr is None and cr is None:
+            rec.update({"iou": None, "missing_mm2": 0.0, "extra_mm2": 0.0})
+        elif mr is not None and cr is not None:
+            inter = mr.intersection(cr)
+            ia = float(inter.area)
+            union_a = ma + ca - ia
+            rec["iou"] = round(ia / union_a, 4) if union_a > 1e-9 else 1.0
+            rec["missing_mm2"] = round(ma - ia, 1)
+            rec["extra_mm2"] = round(ca - ia, 1)
+            try:
+                diff = mr.difference(cr) if ma - ia >= ca - ia else cr.difference(mr)
+                if not diff.is_empty:
+                    rec["region_uv_bounds"] = [round(v, 1) for v in diff.bounds]
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            rec.update({"iou": 0.0, "missing_mm2": round(ma, 1),
+                        "extra_mm2": round(ca, 1)})
+        out.append(rec)
+    return out
+
+
+def render_slice_strip(target_mesh, axis: int, coords, path: str,
+                       cand_mesh=None, per_row: int = 4) -> str | None:
+    """Section drawings at REQUESTED coordinates — the visual zoom lens.
+    Target-only (initial analysis): each slice filled grey with holes white,
+    showing the true internal structure at that station. With a candidate
+    (iteration): agreement grey, MISSING material red, EXTRA blue, IoU per
+    slice. Shared axes limits so slices are visually comparable."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = "xyz"
+    coords = [float(c) for c in coords]
+    if not coords:
+        return None
+    rows = int(np.ceil(len(coords) / per_row))
+    fig, grid = plt.subplots(rows, per_row,
+                             figsize=(3.4 * per_row, 3.2 * rows))
+    grid = np.atleast_2d(grid)
+    # shared u/v limits across all slices for comparability
+    u, v = [i for i in (0, 1, 2) if i != axis]
+    lo3 = np.asarray(target_mesh.bounds[0]); hi3 = np.asarray(target_mesh.bounds[1])
+    if cand_mesh is not None:
+        lo3 = np.minimum(lo3, cand_mesh.bounds[0])
+        hi3 = np.maximum(hi3, cand_mesh.bounds[1])
+    pad = 0.04 * float(max(hi3[u] - lo3[u], hi3[v] - lo3[v], 1.0))
+    for i in range(rows * per_row):
+        ax = grid[i // per_row, i % per_row]
+        ax.set_xticks([]); ax.set_yticks([])
+        if i >= len(coords):
+            ax.set_axis_off()
+            continue
+        c = coords[i]
+        mr = _slice_region(target_mesh, axis, c)
+        title = f"{names[axis]}={c:.2f}"
+        try:
+            if cand_mesh is None:
+                _draw_region(ax, mr, "0.45")
+            else:
+                cr = _slice_region(cand_mesh, axis, c)
+                if mr is not None and cr is not None:
+                    inter = mr.intersection(cr)
+                    ma, ca, ia = mr.area, cr.area, inter.area
+                    union_a = ma + ca - ia
+                    iou = ia / union_a if union_a > 1e-9 else 1.0
+                    _draw_region(ax, inter, "0.75")
+                    _draw_region(ax, mr.difference(cr), (0.85, 0.12, 0.12), z=2)
+                    _draw_region(ax, cr.difference(mr), (0.12, 0.35, 0.88), z=2)
+                    title += f"  IoU {iou:.3f}"
+                else:
+                    _draw_region(ax, mr, (0.85, 0.12, 0.12), z=2)
+                    _draw_region(ax, cr, (0.12, 0.35, 0.88), z=2)
+                    if mr is not None or cr is not None:
+                        title += "  IoU 0"
+        except Exception:  # noqa: BLE001
+            pass
+        ax.set_xlim(lo3[u] - pad, hi3[u] + pad)
+        ax.set_ylim(lo3[v] - pad, hi3[v] + pad)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(title, fontsize=8)
+        ax.set_xlabel(names[u], fontsize=7); ax.set_ylabel(names[v], fontsize=7)
+    if cand_mesh is not None:
+        fig.suptitle("grey=match  red=MISSING material  blue=EXTRA material",
+                     fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def internal_void_summary(mesh, *, n=64) -> dict | None:
     """Quantify the part's OWN internal cavity so the brief can flag it up front:
     total interior-void volume, its fraction of the solid volume, and the axial
