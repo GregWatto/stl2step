@@ -4,14 +4,18 @@ Instead of rebuilding a solid face-by-face and stitching (which fights topology)
 recognize the part's construction and re-draw it with feature operations. The
 topology is then correct by construction, exactly as the original was modelled.
 
-This module implements the first and most common case: EXTRUSIONS. It detects a
-constant cross-section along an axis, extracts and fits that 2D profile into
-clean lines + arcs, and emits a build123d feature script (sketch -> extrude) plus
-the resulting solid. The generated script IS the feature tree.
+The deterministic recognizers, tried cheapest-first by `draw()`:
+  - EXTRUSION   — constant cross-section along an axis (fit to lines + arcs).
+  - REVOLVE     — a profile swept about an axis.
+  - PRISMATIC   — a stack of constant-section slabs (base + boss + pocket + step).
+  - LOFT        — a cross-section that varies continuously along an axis between
+                  flat end caps (square-to-round adapter, drafted/tapered body).
+Each extracts and fits the real profile(s), emits a build123d feature script, and
+is verified against the mesh; the generated script IS the feature tree.
 
-Non-extrusion cases (revolves, multi-feature parts) are where an LLM composes the
-build123d operations; this deterministic extruder is the proof of concept and the
-template for that.
+Parts no recognizer fits (organic/open-shell/multi-axis bodies) fall to the LLM
+compose path or the BREP solid; these deterministic recognizers are the fast,
+exact path when they apply.
 """
 
 from __future__ import annotations
@@ -70,6 +74,18 @@ def draw(mesh, *, dev_tol=0.1):
                 dev = _part_deviation(part, mesh)
                 if dev <= dev_tol:
                     return DrawResult("prismatic", part, script, summary, dev)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Tier 3: lofted (continuously-varying cross-section).
+    try:
+        lf = detect_lofted(mesh)
+        if lf is not None:
+            part, script, summary = draw_lofted(lf, mesh=mesh, dev_tol=dev_tol)
+            if part is not None:
+                dev = _part_deviation(part, mesh)
+                if dev <= dev_tol:
+                    return DrawResult("lofted", part, script, summary, dev)
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -473,6 +489,177 @@ def _emit_prismatic_script(pr, fitted):
                                              for h in hs]:
                 L.extend(_emit_loop_lines(grp, suffix, 8))
         L.append(f"    extrude(amount={_fmt(hi - lo)})")
+    return "\n".join(L)
+
+
+# ----------------------------------------------------------------------------
+# Lofted (multi-section) detection.
+#
+# The case between an extrusion (constant section) and a revolve (rotational): a
+# section that changes CONTINUOUSLY along an axis — a square-to-round adapter, a
+# drafted/tapered body, a transition duct. We find the axis with flat end caps
+# and a section that varies (not constant -> not an extrude; not stepwise ->
+# not a prismatic stack), sample the section at several stations, fit each to
+# lines/arcs, and rebuild as a LOFT through the sampled profiles. A section-wide
+# through-hole is lofted and subtracted too.
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Lofted:
+    axis: int                 # 0=x, 1=y, 2=z (the loft/sweep axis)
+    stations: list            # [(coord, ext(N,2), [hole(M,2), ...]), ...] end->end
+
+
+def _poly_area(pts):
+    x, y = np.asarray(pts)[:, 0], np.asarray(pts)[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def detect_lofted(mesh, *, n_stations=8, vary_tol=0.03, cap_frac=0.02,
+                  angle_tol_deg=2.0):
+    """Return a Lofted if the part is a single body whose cross-section varies
+    continuously along an axis with flat caps at both ends, else None. Ordered so
+    a plain extrusion (constant section) and a prismatic stack are preferred by
+    the dispatcher before this is tried."""
+    fn = np.asarray(mesh.face_normals, dtype=float)
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces)
+    cos_tol = np.cos(np.radians(angle_tol_deg))
+    total_area = float(areas.sum())
+
+    for axis in (2, 1, 0):
+        lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+        length = hi - lo
+        if length <= 1e-6:
+            continue
+        eps = max(1e-3 * length, 0.05)
+        # flat end caps: perpendicular face area near both extremes
+        perp = np.abs(fn[:, axis]) > cos_tol
+        if not perp.any():
+            continue
+        cc = V[F[perp]][:, :, axis].mean(axis=1)
+        pa = areas[perp]
+        bot = float(pa[cc < lo + 3 * eps].sum())
+        top = float(pa[cc > hi - 3 * eps].sum())
+        if bot < cap_frac * total_area or top < cap_frac * total_area:
+            continue
+
+        # sample interior sections (largest polygon at each), place ends at lo/hi
+        fracs = np.linspace(0.0, 1.0, n_stations)
+        stations, sec_areas, ok = [], [], True
+        for k, fr in enumerate(fracs):
+            coord = lo + eps + fr * (length - 2 * eps)   # sample just inside caps
+            polys = _section_polys(mesh, axis, coord)
+            if not polys:
+                ok = False; break
+            ext, ints = max(polys, key=lambda pi: _poly_area(pi[0]))
+            place = lo if k == 0 else (hi if k == len(fracs) - 1 else coord)
+            stations.append((place, ext, ints))
+            sec_areas.append(_poly_area(ext))
+        if not ok or len(stations) < 3:
+            continue
+        a = np.asarray(sec_areas)
+        if a.max() <= 0 or (a.max() - a.min()) / a.max() < vary_tol:
+            continue     # ~constant section -> an extrusion, not a loft
+        return Lofted(axis=axis, stations=stations)
+    return None
+
+
+def _fit_lofted(spec, *, arcs):
+    """Fit each station's exterior (+ a single through-hole if present at every
+    station) into line/arc/circle segments. Returns (outer, holes) or None."""
+    outer, holes, all_have_hole = [], [], True
+    for coord, ext, ints in spec.stations:
+        es = fit_loop(ext, arcs=arcs)
+        if not es:
+            return None
+        outer.append((coord, es))
+        if ints:
+            hs = fit_loop(max(ints, key=_poly_area), arcs=arcs)
+            holes.append((coord, hs)) if hs else holes.append((coord, None))
+        else:
+            all_have_hole = False
+    if not (all_have_hole and holes and all(h for _, h in holes)):
+        holes = None
+    return outer, holes
+
+
+def draw_lofted(spec: Lofted, mesh=None, *, dev_tol=0.1):
+    """Build the lofted solid + feature-tree script.
+
+    OCCT's ThruSections can only loft wires of compatible topology, so two shapes
+    of loft need different section sets: a same-topology varying loft (a barrel /
+    curved taper — every section a circle or every section a square) lofts cleanly
+    through ALL sampled stations, while a topology-changing ruled loft (square ->
+    round) only lofts between its two clean end caps. Try the full stack first,
+    fall back to the two ends, and keep whichever builds and verifies best."""
+    n = len(spec.stations)
+    idx_options = [list(range(n)), [0, n - 1]]
+    best = None                        # (dev, part, fitted, idx)
+    for arcs in (True, False):
+        fitted = _fit_lofted(spec, arcs=arcs)
+        if fitted is None:
+            continue
+        for idx in idx_options:
+            part = _build_lofted(spec, fitted, idx)
+            if part is None:
+                continue
+            dev = _part_deviation(part, mesh) if mesh is not None else 0.0
+            if best is None or dev < best[0]:
+                best = (dev, part, fitted, idx)
+            if dev <= dev_tol:
+                break
+        if best is not None and best[0] <= dev_tol:
+            break
+    if best is None:
+        return None, None, None
+    dev, part, fitted, idx = best
+    script = _emit_lofted_script(spec, fitted, idx)
+    outer, holes = fitted
+    summary = {"stations": len(idx), "lofted_hole": bool(holes)}
+    return part, script, summary
+
+
+def _build_lofted(spec, fitted, idx):
+    from build123d import (BuildPart, BuildSketch, Plane, Mode, loft)
+    outer, holes = fitted
+    base = getattr(Plane, _PLANE[spec.axis])
+    try:
+        with BuildPart() as part:
+            for i in idx:
+                coord, es = outer[i]
+                with BuildSketch(base.offset(coord)):
+                    _sketch_loop(es, Mode.ADD)
+            loft()
+            if holes:
+                for i in idx:
+                    coord, hs = holes[i]
+                    with BuildSketch(base.offset(coord)):
+                        _sketch_loop(hs, Mode.ADD)
+                loft(mode=Mode.SUBTRACT)
+        return part.part
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _emit_lofted_script(spec, fitted, idx):
+    outer, holes = fitted
+    pl = _PLANE[spec.axis]
+    L = ["from build123d import *", "",
+         f"# Reconstructed loft along {pl} normal through {len(idx)} sections",
+         "", "with BuildPart() as part:"]
+    for i in idx:
+        coord, es = outer[i]
+        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(coord)})):")
+        L.extend(_emit_loop_lines(es, "", 8))
+    L.append("    loft()")
+    if holes:
+        L.append("    # through-hole lofted and subtracted")
+        for i in idx:
+            coord, hs = holes[i]
+            L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(coord)})):")
+            L.extend(_emit_loop_lines(hs, "", 8))
+        L.append("    loft(mode=Mode.SUBTRACT)")
     return "\n".join(L)
 
 

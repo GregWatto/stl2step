@@ -39,7 +39,8 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.convert <PART.stl> -o <OUT.step> --
 ```
 
 If it prints `RESULT: PASS`, you're done: a single extrusion / revolve / prismatic
-stack was recognized and `<WORKDIR>/feature_tree.py` is the editable recipe. Show
+stack / loft (continuously-varying section, e.g. a square-to-round adapter) was
+recognized and `<WORKDIR>/feature_tree.py` is the editable recipe. Show
 the user the metrics and the feature tree. Only continue below if it fell back to
 BREP (`method: solid`) or you want a cleaner feature model than BREP gives.
 
