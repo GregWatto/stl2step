@@ -65,15 +65,17 @@ def draw(mesh, *, dev_tol=0.1):
     if passing:
         return min(passing, key=lambda c: c.deviation)
 
-    # Tier 2: multi-feature prismatic stack.
+    # Tier 2: multi-feature prismatic stack. Try each candidate layering axis,
+    # build+verify, and return the first that passes (candidates are ordered so
+    # the most-decomposed stack is tried first).
     try:
-        pr = detect_prismatic(mesh)
-        if pr is not None:
+        for pr in _prismatic_candidates(mesh):
             part, script, summary = draw_prismatic(pr, mesh=mesh, dev_tol=dev_tol)
-            if part is not None:
-                dev = _part_deviation(part, mesh)
-                if dev <= dev_tol:
-                    return DrawResult("prismatic", part, script, summary, dev)
+            if part is None:
+                continue
+            dev = _part_deviation(part, mesh)
+            if dev <= dev_tol:
+                return DrawResult("prismatic", part, script, summary, dev)
     except Exception:  # noqa: BLE001
         pass
 
@@ -169,25 +171,50 @@ class Prismatic:
 
 
 def detect_prismatic(mesh, *, angle_tol_deg=2.0):
-    """Return a Prismatic if the part is a stack of >=2 constant-section slabs
-    along some axis, else None. Picks the axis with the most flat-cap area (the
-    dominant layering direction), falling back to another axis if that one has
-    no interior section change."""
+    """Return the best Prismatic (a stack of >=2 constant-section slabs along an
+    axis) or None. See `_prismatic_candidates` for how the layering axis is
+    chosen — crucially by whether each slab's section is actually constant, not
+    just by flat-cap area (which mis-picks the axis for parts like an open
+    corner shell whose big vertical walls dominate the cap area)."""
+    cands = _prismatic_candidates(mesh, angle_tol_deg=angle_tol_deg)
+    return cands[0] if cands else None
+
+
+def _prismatic_candidates(mesh, *, angle_tol_deg=2.0):
+    """All axes that read as a genuine prismatic stack, best first. An axis
+    qualifies only if it has >=2 slabs AND each slab's cross-section is constant
+    within the slab (the definition of a prismatic level) — this is what rejects
+    a wrong layering axis, whose 'slabs' span continuously-varying geometry.
+    Ordered by slab count then cap area; the dispatcher builds and verifies each,
+    so ordering only affects which is tried first."""
     fn = np.asarray(mesh.face_normals, dtype=float)
     areas = np.asarray(mesh.area_faces, dtype=float)
     cos_tol = np.cos(np.radians(angle_tol_deg))
     cap_area = [float(areas[np.abs(fn[:, a]) > cos_tol].sum()) for a in (0, 1, 2)]
-    for axis in sorted((0, 1, 2), key=lambda a: -cap_area[a]):
+    cands = []
+    for axis in (0, 1, 2):
         levels = _prismatic_levels(mesh, axis, cos_tol)
         if levels is not None:
-            return Prismatic(axis=axis, levels=levels)
-    return None
+            cands.append((Prismatic(axis=axis, levels=levels),
+                          len(levels), cap_area[axis]))
+    cands.sort(key=lambda t: (-t[1], -t[2]))
+    return [c[0] for c in cands]
 
 
-def _prismatic_levels(mesh, axis, cos_tol, *, min_slab_frac=0.01):
+def _section_total_area(mesh, axis, coord):
+    polys = _section_polys(mesh, axis, coord)
+    if not polys:
+        return None
+    return float(sum(_poly_area(ext) for ext, _ in polys))
+
+
+def _prismatic_levels(mesh, axis, cos_tol, *, min_slab_frac=0.01,
+                      const_tol=0.15):
     """Slab boundaries along `axis`: the axis coordinates of the flat caps
     (faces whose normal is ~parallel to the axis). Requires >=1 interior break
-    (i.e. a genuine multi-level part, not a plain extrusion)."""
+    (a genuine multi-level part, not a plain extrusion) AND that each slab's
+    cross-section is constant within the slab (else `axis` isn't the layering
+    axis — its 'slabs' vary continuously, so reject it)."""
     fn = np.asarray(mesh.face_normals, dtype=float)
     areas = np.asarray(mesh.area_faces, dtype=float)
     V = np.asarray(mesh.vertices); F = np.asarray(mesh.faces)
@@ -218,6 +245,15 @@ def _prismatic_levels(mesh, axis, cos_tol, *, min_slab_frac=0.01):
         polys = _section_polys(mesh, axis, 0.5 * (a + b))
         if not polys:
             return None
+        # constancy: sample the slab interior; a real prismatic level holds its
+        # cross-section, so a big area swing means `axis` is not the stack axis.
+        if b - a > 4 * coord_tol:
+            aa = [_section_total_area(mesh, axis, a + f * (b - a))
+                  for f in (0.25, 0.5, 0.75)]
+            if any(x is None or x <= 0 for x in aa):
+                return None
+            if (max(aa) - min(aa)) / max(aa) > const_tol:
+                return None
         levels.append((a, b, polys))
     return levels if len(levels) >= 2 else None
 
