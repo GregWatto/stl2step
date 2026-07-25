@@ -138,11 +138,27 @@ convention — a thread's mesh geometry is the *evidence*, the spec is the
   The engineer re-applies Thread(M10x1.5) in Fusion in seconds *because the spec
   is known*.
 - **Threaded stud** → plain cylinder at the **major (nominal) Ø**, spec recorded.
-- **Never surface-fit the helix.** Residual deviation confined to an identified
-  thread band (~half the thread depth) is expected — state it with the spec in
-  the final summary instead of chasing it. Modeled 3D threads (for printing) are
-  possible via `bd_warehouse`'s IsoThread if the user asks — it is not installed
-  by default.
+- **Never surface-fit the helix.** After identifying the spec, declare the band
+  to the verify step so the gates don't punish the correct nominal model:
+
+  ```
+  ... -m stlstep.compose run <PART.stl> <WORKDIR> attempt.py --thread-band "z,cu,cv,t0,t1,r0,r1"
+  ```
+
+  (axis letter, axis position cu,cv in the perpendicular plane, axial band
+  t0,t1, radial shell r0,r1 spanning minor/2−0.4 to major/2+0.4; repeatable for
+  multiple threads.) Deviation samples and occupancy area inside declared bands
+  are excluded — with the band declared, a correct nominal model of a threaded
+  part PASSES; without it, the helix residual fails the gates. State the spec +
+  band in the final summary. Modeled 3D threads (for printing) are possible via
+  `bd_warehouse`'s IsoThread if the user asks — it is not installed by default.
+
+The brief helps you find threads: hole/boss lines print `THREADED <spec>` when
+identified automatically, and `possible THREAD near [x,y,z]` marks clusters of
+tiny cylinder fragments (a helical wall shatters into these under segmentation)
+— always run `probe thread` there before modelling. With threads recognized,
+fillet demands from the feature check become advisory (helix flanks can read as
+fillets).
 
 **"Curves" are usually flat facets + fillets.** Before you approximate a curved
 region with boxes, run `normals`: if a handful of clusters cover ~90% of the area,

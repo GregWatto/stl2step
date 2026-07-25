@@ -161,7 +161,52 @@ def _holes_region(region):
         return None
 
 
-def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40) -> dict:
+def _band_slice_region(band, axis, coord):
+    """The thread band's footprint on the slice plane {axis == coord} as a
+    shapely region, or None if it doesn't intersect. Aligned slice (plane ⟂ the
+    band axis): an annulus. Perpendicular slice (plane containing/beside the
+    band axis): the shell appears as one or two rectangular strips. Only
+    world-axis-aligned bands are handled (declared bands always are)."""
+    from shapely.geometry import Point, box
+    from shapely.ops import unary_union
+    d = np.asarray(band["axis"], dtype=float)
+    p = np.asarray(band["point"], dtype=float)
+    r0, r1 = band["r"]
+    t0, t1 = sorted(band["t"])
+    bi = int(np.argmax(np.abs(d)))
+    if abs(d[bi]) < 0.99:
+        return None
+    u, v = [i for i in (0, 1, 2) if i != axis]
+    if bi == axis:                       # slice ⟂ band axis -> annulus
+        if not (p[axis] + t0 - 0.5 <= coord <= p[axis] + t1 + 0.5):
+            return None
+        c = Point(float(p[u]), float(p[v]))
+        ring = c.buffer(r1 + 0.05)
+        if r0 > 0.05:
+            ring = ring.difference(c.buffer(max(0.0, r0 - 0.05)))
+        return ring
+    # slice parallel to the band axis -> strips at |w - center| in [w_in, w_out]
+    dxf = float(coord - p[axis])
+    if abs(dxf) >= r1:
+        return None
+    w = v if bi == u else u              # the in-slice dim across the band
+    w_out = float(np.sqrt(max(r1 * r1 - dxf * dxf, 0.0))) + 0.05
+    w_in = float(np.sqrt(max(r0 * r0 - dxf * dxf, 0.0)))
+    b_lo, b_hi = float(p[bi] + t0 - 0.5), float(p[bi] + t1 + 0.5)
+
+    def rect(w_lo, w_hi):
+        wc = float(p[w])
+        if bi == u:                      # u = band axis dim, v = across dim
+            return box(b_lo, wc + w_lo, b_hi, wc + w_hi)
+        return box(wc + w_lo, b_lo, wc + w_hi, b_hi)
+
+    if w_in < 0.05:
+        return rect(-w_out, w_out)
+    return unary_union([rect(w_in, w_out), rect(-w_out, -w_in)])
+
+
+def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
+                    exclude_bands=None) -> dict:
     """Compare solid-vs-void occupancy of the part and the candidate by slicing
     both along each axis and intersecting the filled regions.
 
@@ -194,6 +239,20 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40) -> dict:
             ca = float(cr.area) if cr is not None else 0.0
             if mr is None and cr is None:
                 continue
+            # mask identified thread-band rings on aligned slices: a nominal
+            # hole/stud legitimately differs from the mesh helix there
+            if exclude_bands:
+                for band in exclude_bands:
+                    region = _band_slice_region(band, axis, c)
+                    if region is None:
+                        continue
+                    try:
+                        mr = mr.difference(region) if mr is not None else None
+                        cr = cr.difference(region) if cr is not None else None
+                    except Exception:  # noqa: BLE001
+                        pass
+                ma = float(mr.area) if mr is not None else 0.0
+                ca = float(cr.area) if cr is not None else 0.0
             if mr is not None and cr is not None:
                 inter = mr.intersection(cr)
                 ia = float(inter.area)
@@ -499,6 +558,46 @@ def internal_void_summary(mesh, *, n=64) -> dict | None:
     return {"axis": "xyz"[axis], "void_mm3": round(void_vol, 1),
             "void_frac": round(void_vol / filled_vol, 4),
             "cavity_band_mm": band}
+
+
+def thread_bands(analysis: dict) -> list[dict]:
+    """Cylindrical shells occupied by IDENTIFIED threads, from the analysis.
+    A correctly-modelled nominal hole/stud legitimately deviates from the mesh
+    helix inside these bands (~half the thread depth), so the verify step
+    excludes sample points here rather than punishing the right model."""
+    bands = []
+    feats = (analysis or {}).get("features") or {}
+    for kind in ("holes", "bosses"):
+        for f in feats.get(kind, []):
+            td = f.get("threaded")
+            if not td:
+                continue
+            r0 = 0.5 * td["minor_diameter_mm"] - 0.4
+            r1 = 0.5 * td["major_diameter_mm"] + 0.4
+            depth = float(f.get("depth_mm", 0) or 0)
+            for pos in f.get("positions_mm", []):
+                bands.append({"point": [float(x) for x in pos],
+                              "axis": [float(x) for x in f["axis"]],
+                              "t": [-depth - 2.0, 2.0],     # pos is the hi end
+                              "r": [max(0.0, r0), r1],
+                              "label": td.get("spec") or
+                              f"pitch {td['pitch_mm']}"})
+    return bands
+
+
+def mask_points_in_bands(pts, bands):
+    """Boolean keep-mask: False for points inside any thread band shell."""
+    pts = np.asarray(pts, dtype=float)
+    keep = np.ones(len(pts), dtype=bool)
+    for b in bands:
+        d = np.asarray(b["axis"], dtype=float)
+        d = d / (np.linalg.norm(d) or 1.0)
+        rel = pts - np.asarray(b["point"], dtype=float)
+        t = rel @ d
+        r = np.linalg.norm(rel - t[:, None] * d[None, :], axis=1)
+        keep &= ~((t >= b["t"][0]) & (t <= b["t"][1])
+                  & (r >= b["r"][0]) & (r <= b["r"][1]))
+    return keep
 
 
 def candidate_features(shape) -> dict:

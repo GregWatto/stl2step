@@ -506,10 +506,15 @@ def exec_script(script: str):
 
 
 def run_candidate(script: str, mesh: trimesh.Trimesh, workdir: str,
-                  *, tag: str = "cand", dev_samples: int = 40000) -> Candidate:
+                  *, tag: str = "cand", dev_samples: int = 40000,
+                  exclude_bands: list | None = None) -> Candidate:
     """Execute a proposed script, measure it against the mesh, and render both a
     shaded view and a deviation colormap. Never raises — a failure comes back as
-    a Candidate with ok=False and the error text (that IS the refine signal)."""
+    a Candidate with ok=False and the error text (that IS the refine signal).
+
+    `exclude_bands`: cylindrical shells of IDENTIFIED threads — a nominal
+    hole/stud legitimately deviates from the mesh helix there, so those sample
+    points are excluded from the deviation quantiles (counts reported)."""
     from . import occ_util as ou
     os.makedirs(workdir, exist_ok=True)
     try:
@@ -524,10 +529,19 @@ def run_candidate(script: str, mesh: trimesh.Trimesh, workdir: str,
     rv, rf = ou.shape_to_mesh(shape, 0.05)
     gen = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
 
+    excl_fwd = excl_rev = 0
     pts, _ = trimesh.sample.sample_surface(mesh, dev_samples)
-    _, fwd, _ = trimesh.proximity.closest_point(gen, np.asarray(pts))
+    pts = np.asarray(pts)
     gpts, _ = trimesh.sample.sample_surface(gen, min(dev_samples, 20000))
-    _, rev, _ = trimesh.proximity.closest_point(mesh, np.asarray(gpts))
+    gpts = np.asarray(gpts)
+    if exclude_bands:
+        from . import featurecheck as fc
+        keep = fc.mask_points_in_bands(pts, exclude_bands)
+        excl_fwd = int((~keep).sum()); pts = pts[keep]
+        keep = fc.mask_points_in_bands(gpts, exclude_bands)
+        excl_rev = int((~keep).sum()); gpts = gpts[keep]
+    _, fwd, _ = trimesh.proximity.closest_point(gen, pts)
+    _, rev, _ = trimesh.proximity.closest_point(mesh, gpts)
 
     cand = Candidate(
         ok=True, script=script, part=part,
@@ -536,7 +550,8 @@ def run_candidate(script: str, mesh: trimesh.Trimesh, workdir: str,
         valid=bool(ou.is_valid(shape)), closed=_is_solid(shape),
         volume_mm3=float(part.volume),
         metrics={"fwd_max": float(fwd.max()), "rev_max": float(rev.max()),
-                 "brep_faces": ou.count_faces(shape)},
+                 "brep_faces": ou.count_faces(shape),
+                 "thread_band_excluded": [excl_fwd, excl_rev]},
     )
     # renders: candidate shaded, + candidate coloured by deviation to the mesh
     cand.render_png = render_views(gen, os.path.join(workdir, f"{tag}_model.png"),
@@ -860,11 +875,23 @@ def _cli_brief(args) -> int:
             cb = (f" +c'bore Ø{h['counterbore']['diameter_mm']}x"
                   f"{h['counterbore']['depth_mm']}" if h.get("counterbore") else "")
             thru = {True: "through", False: "blind", None: "?"}[h.get("through")]
+            td = h.get("threaded")
+            ts = (f"  THREADED {td.get('spec') or ('pitch %.2f' % td['pitch_mm'])}"
+                  f" (model at minor Ø{td['minor_diameter_mm']}, record spec)"
+                  if td else "")
             print(f"    hole Ø{h['diameter_mm']} {thru} depth {h['depth_mm']} "
-                  f"x{h['count']} [{h['arrangement']}]{cb}")
+                  f"x{h['count']} [{h['arrangement']}]{cb}{ts}")
         for b in feats.get("bosses", []):
+            td = b.get("threaded")
+            ts = (f"  THREADED {td.get('spec') or ('pitch %.2f' % td['pitch_mm'])}"
+                  f" (model at major Ø{td['major_diameter_mm']}, record spec)"
+                  if td else "")
             print(f"    boss Ø{b['diameter_mm']} h{b['depth_mm']} "
-                  f"x{b['count']} [{b['arrangement']}]")
+                  f"x{b['count']} [{b['arrangement']}]{ts}")
+        for tc in feats.get("thread_candidates", []):
+            print(f"    possible THREAD near {tc['center_mm']} "
+                  f"(extent {tc['extent_mm']}, {tc['fragments']} helical "
+                  f"fragments) — identify with `probe thread` before modelling")
         for pk in feats.get("pockets", []):
             print(f"    pocket {pk['size_mm']} depth {pk['depth_mm']} "
                   f"floor@{pk['floor_level_mm']} normal {pk['opening_normal']}")
@@ -884,15 +911,56 @@ def _cli_brief(args) -> int:
     return 0
 
 
+def _parse_thread_band(spec: str) -> dict:
+    """--thread-band 'axis,cu,cv,t0,t1,r0,r1' -> band dict. cu,cv are the axis
+    position in the perpendicular plane (in x,y,z order minus the axis)."""
+    parts = spec.split(",")
+    ai = {"x": 0, "y": 1, "z": 2}[parts[0].strip()]
+    cu, cv, t0, t1, r0, r1 = (float(x) for x in parts[1:7])
+    u, v = [i for i in (0, 1, 2) if i != ai]
+    pt = [0.0, 0.0, 0.0]
+    pt[u], pt[v] = cu, cv
+    d = [0.0, 0.0, 0.0]; d[ai] = 1.0
+    return {"point": pt, "axis": d, "t": [t0, t1], "r": [r0, r1],
+            "label": "declared"}
+
+
 def _cli_run(args) -> int:
     from .ingest import load_and_repair
     from . import featurecheck as fc
     with open(args.script) as fp:
         script = fp.read()
     ing = load_and_repair(args.stl)
-    cand = run_candidate(script, ing.mesh, args.workdir, tag=args.tag)
+
+    # thread bands: auto (identified in the analysis) + declared (--thread-band
+    # after a `probe thread` identification). A nominal hole/stud legitimately
+    # deviates from the mesh helix inside these; exclude, don't punish.
+    analysis = None
+    apath = os.path.join(args.workdir, "analysis.json")
+    if os.path.exists(apath):
+        try:
+            with open(apath) as fp:
+                analysis = json.load(fp)
+        except Exception:  # noqa: BLE001
+            analysis = None
+    bands = fc.thread_bands(analysis) if analysis else []
+    for spec in (args.thread_band or []):
+        try:
+            bands.append(_parse_thread_band(spec))
+        except Exception:  # noqa: BLE001
+            raise SystemExit(f"bad --thread-band {spec!r} "
+                             f"(want axis,cu,cv,t0,t1,r0,r1)")
+
+    cand = run_candidate(script, ing.mesh, args.workdir, tag=args.tag,
+                         exclude_bands=bands or None)
     mv = float(ing.mesh.volume) if ing.mesh.is_watertight else None
     print(cand.feedback(mv))
+    if bands and cand.ok:
+        ex = cand.metrics.get("thread_band_excluded", [0, 0])
+        print(f"thread bands: {len(bands)} recognized "
+              f"({', '.join(b['label'] for b in bands)}) — excluded "
+              f"{ex[0]}+{ex[1]} deviation samples (nominal thread "
+              f"representation is correct there)")
 
     # size-relative tolerance: a fixed mm bar is wrong across scales.
     tol = args.tol if args.tol is not None else fc.size_tol(ing.mesh)
@@ -904,12 +972,17 @@ def _cli_run(args) -> int:
     # part's holes/fillets/chamfers are actually modelled as editable ops.
     gaps, hard_gap = [], False
     if cand.ok:
-        apath = os.path.join(args.workdir, "analysis.json")
-        if os.path.exists(apath):
+        if analysis is not None:
             try:
-                with open(apath) as fp:
-                    analysis = json.load(fp)
                 gaps = fc.feature_gap(analysis, cand.part.wrapped)
+                if bands:
+                    # helix flanks masquerade as fillet bands in the detector;
+                    # with threads recognized, fillet demands become advisory
+                    for g in gaps:
+                        if g["kind"] == "fillet":
+                            g["found"] = None
+                            g["note"] += (" (thread present — helix flanks can "
+                                          "read as fillets; confirm visually)")
                 print(fc.format_gap(gaps))
                 hard_gap = any(g["found"] is not None and g["found"] < g["expected"]
                                for g in gaps)
@@ -932,7 +1005,7 @@ def _cli_run(args) -> int:
             from . import occ_util as ou
             rv, rf = ou.shape_to_mesh(cand.part.wrapped, 0.1)
             cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
-            occ = fc.slice_occupancy(ing.mesh, cg)
+            occ = fc.slice_occupancy(ing.mesh, cg, exclude_bands=bands or None)
             if occ and occ.get("mean_iou") is not None:
                 print(f"slice occupancy (solid-vs-void, 3 axes): mean IoU "
                       f"{occ['mean_iou']}  |  MISSING material {occ['missing_mm3']}"
@@ -1111,6 +1184,10 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="execute + verify a proposed build123d script")
     r.add_argument("stl"); r.add_argument("workdir"); r.add_argument("script")
     r.add_argument("--tag", default="iter0")
+    r.add_argument("--thread-band", action="append", default=None,
+                   help="declare an identified thread band to exclude from "
+                        "deviation: axis,cu,cv,t0,t1,r0,r1 (repeatable; use "
+                        "after `probe thread` confirms a spec)")
     r.add_argument("--tol", type=float, default=None,
                    help="deviation tolerance mm (default: 0.1%% of bbox diagonal)")
     r.add_argument("--out", default=None, help="export STEP here if it builds")
@@ -1123,6 +1200,8 @@ def main(argv=None) -> int:
     f.add_argument("--tol", type=float, default=None)
     f.add_argument("--max-evals", type=int, default=400)
     f.add_argument("--out", default=None, help="export STEP here if it builds")
+    f.add_argument("--thread-band", action="append", default=None,
+                   help="same as run --thread-band (fit re-verifies via run)")
     f.set_defaults(fn=_cli_fit)
 
     c = sub.add_parser("compare", help="matched-view render of target vs candidate "

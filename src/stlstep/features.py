@@ -148,6 +148,7 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         cyls.append({"dia": float(s["diameter_mm"]), "axis": axis,
                      "ea": np.asarray(s["end_a_mm"], float),
                      "eb": np.asarray(s["end_b_mm"], float),
+                     "area": float(s.get("area_mm2", 0) or 0),
                      "orient": s["orientation"]})
 
     # 1) bucket cylinders by axis line (coaxial) and hole-vs-boss
@@ -160,10 +161,32 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
                "boss" if "boss" in c["orient"] else "?")
         buckets.setdefault(key, []).append(c)
 
-    holes, bosses = [], []
+    holes, bosses, micro = [], [], []
     for (akey, _pk, kind), cs in buckets.items():
         axis = _unit(np.asarray(akey, float))
         loc = _collapse_coaxial(cs, axis, mesh)
+        # fragment fits: tiny/shallow cylinders, or fits whose segmented area
+        # covers only a sliver of their own cylinder surface, are fragments of
+        # helical/noisy walls — not real features. They'd pollute the brief with
+        # dozens of junk holes; divert them to the thread-candidate pool: where
+        # they CLUSTER is where a thread (or knurl) lives.
+        cov_area = sum(c["area"] for c in cs)
+        full_area = np.pi * loc["diameter_mm"] * max(loc["depth_mm"], 1e-6)
+        if (loc["diameter_mm"] < 1.0 or loc["depth_mm"] < 1.2
+                or cov_area < 0.3 * full_area):
+            micro.append(loc)
+            continue
+        try:
+            sig = thread_signature(
+                mesh, np.asarray(loc["axis"], float), loc["_at"][0],
+                t_range=(-max(4.0, 0.75 * loc["depth_mm"]),
+                         loc["depth_mm"] + max(4.0, 0.75 * loc["depth_mm"])),
+                r_hint=0.5 * loc["diameter_mm"],
+                internal=(kind == "hole"))
+            if sig is not None:
+                loc["threaded"] = sig
+        except Exception:  # noqa: BLE001 — thread check must not break grouping
+            pass
         (holes if kind == "hole" else bosses if kind == "boss" else holes).append(loc)
 
     try:
@@ -176,11 +199,59 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         "holes": _patternize(holes),
         "bosses": _patternize(bosses),
         "pockets": pockets,
+        "thread_candidates": _thread_candidates(micro, diag),
         "low_confidence_fits": _degenerate(surfaces, diag),
         "notes": ["round/oblique pockets and slots aren't grouped — read those "
                   "off the cross-sections and the plane list"],
     }
     return features
+
+
+def _thread_candidates(micro: list[dict], diag: float) -> list[dict]:
+    """Spatial clusters of micro cylinder fits = likely thread (or knurl) zones.
+    A helical wall shatters into dozens of tiny cylinder fragments under
+    segmentation; individually they're junk, but where they cluster is exactly
+    where a thread lives. Emit the cluster centre + extent so the agent runs
+    `probe thread` there."""
+    if len(micro) < 3:
+        return []
+    pts = np.array([0.5 * (m["_at"][0] + m["_at"][1]) for m in micro])
+    dias = np.array([m["diameter_mm"] for m in micro])
+    # generous link radius: fragments of one thread scatter across its whole
+    # bore diameter + length; over-merging HINTS is harmless (they're pointers
+    # for `probe thread`, not features)
+    link = max(20.0, 0.12 * diag)
+    labels = -np.ones(len(pts), dtype=int)
+    nl = 0
+    for i in range(len(pts)):
+        if labels[i] >= 0:
+            continue
+        stack = [i]; labels[i] = nl
+        while stack:
+            j = stack.pop()
+            near = np.where((labels < 0) &
+                            (np.linalg.norm(pts - pts[j], axis=1) < link))[0]
+            labels[near] = nl
+            stack.extend(near.tolist())
+        nl += 1
+    out = []
+    for k in range(nl):
+        m = labels == k
+        # >=5 fragments, or >=3 that agree on diameter (crest slivers of one
+        # thread share the crest Ø — strong evidence even in a small cluster)
+        same_dia = (m.sum() >= 3 and dias[m].mean() > 1e-6
+                    and dias[m].std() < 0.1 * dias[m].mean())
+        if m.sum() < 5 and not same_dia:
+            continue
+        p = pts[m]
+        out.append({"center_mm": [round(float(x), 1) for x in p.mean(axis=0)],
+                    "extent_mm": [round(float(x), 1)
+                                  for x in (p.max(axis=0) - p.min(axis=0))],
+                    "fragments": int(m.sum()),
+                    "note": "cluster of tiny cylinder fragments — likely a "
+                            "THREAD (or knurl): run `probe thread` here"})
+    out.sort(key=lambda c: -c["fragments"])
+    return out[:4]
 
 
 def _collapse_coaxial(cs, axis, mesh) -> dict:
