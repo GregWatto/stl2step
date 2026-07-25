@@ -147,6 +147,18 @@ Write a build123d script to `<WORKDIR>/attempt.py`:
   or the rotational profile), then add features: holes as `Circle(...) ,
   mode=Mode.SUBTRACT` extrudes on the right face/plane, bosses as adds, fillets
   and chamfers with `fillet`/`chamfer` on the relevant edges.
+- **INTERNAL CAVITIES — the biggest trap.** `extrude`/`revolve` build the OUTER
+  form; they do NOT create internal structure. If the brief prints
+  `INTERNAL CAVITY` (or the part is a housing/nozzle/manifold), the part is HOLLOW
+  inside and you must CUT that cavity, or you ship a solid blob that only looks
+  right from outside. A revolve of the outer silhouette discards EVERY internal
+  feature — an off-axis chamber, a swirl/volute, a counterbored seat, internal
+  thread relief. To model it: take **transverse sections** through the cavity band
+  (`probe sections --axis <a> --at=<coords>` — interior loops are the cavity
+  walls), read the cavity's real cross-section from `part_sections.png`, and
+  subtract it (`Mode.SUBTRACT`). An off-axis cavity is NOT a revolve — build it as
+  a positioned cut. The verify step measures internal void and will FAIL a solid
+  model of a hollow part, so model the inside, not just the outline.
 - **Fillets & chamfers**: the brief's `edge_treatments` flags approximate fillet
   radii/counts (the segmenter hides them in freeform, so they're a hint — often
   ~10% high). Fillets show as ARCS in the cross-sections, chamfers as short

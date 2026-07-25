@@ -842,6 +842,17 @@ def _cli_brief(args) -> int:
         print(f"  sections : {brief.sections_png}   <- Read this (INTERNAL geometry)")
     print(f"  bbox {a['bounding_box']['size']} mm  min {a['bounding_box']['min']}  "
           f"volume {a['volume_mm3']} mm^3  watertight={a['watertight']}")
+    if not a["watertight"]:
+        print("  WARNING: mesh is NOT watertight — volume/contains checks are "
+              "unreliable; trust the cross-sections for internal geometry.")
+    from . import featurecheck as fc
+    voidsum = fc.internal_void_summary(ing.mesh)
+    if voidsum and voidsum["void_frac"] > 0.02:
+        print(f"  INTERNAL CAVITY: {voidsum['void_mm3']} mm^3 of internal void "
+              f"({100*voidsum['void_frac']:.1f}% of solid), concentrated along "
+              f"{voidsum['axis']} in {voidsum['cavity_band_mm']} mm. The part is "
+              f"HOLLOW inside here — model the cavity (section it in the transverse "
+              f"slices and cut it); a solid body will fail the internal-void check.")
     feats = a.get("features") or {}
     if feats.get("holes") or feats.get("bosses") or feats.get("pockets"):
         print("  features (grouped):")
@@ -908,9 +919,35 @@ def _cli_run(args) -> int:
             print("feature check: skipped (run `brief` first to write "
                   "analysis.json for feature-completeness checking)")
 
+    # internal-void fidelity: the surface-distance metric barely penalises a
+    # filled-in internal cavity (a chamber / channel / internal thread relief), so
+    # check it directly by comparing cross-section hole area. Catches "the model
+    # is solid where the part is hollow" — the vortex failure.
+    void = None
+    void_gap = False
+    if cand.ok:
+        try:
+            from . import occ_util as ou
+            rv, rf = ou.shape_to_mesh(cand.part.wrapped, 0.1)
+            cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+            void = fc.internal_void_gap(ing.mesh, cg)
+            if void:
+                print(f"internal void: candidate MISSING "
+                      f"{void['missing_void_mm3']}mm^3 "
+                      f"({100*void['missing_frac']:.1f}%) of the part's internal "
+                      f"cavity; EXTRA void {void['extra_void_mm3']}mm^3 "
+                      f"({100*void['extra_frac']:.1f}%)")
+                void_gap = void["missing_frac"] > 0.03
+                if void_gap:
+                    print("  ^ the part is HOLLOW where your model is SOLID — an "
+                          "internal cavity/chamber/channel/thread-relief is not "
+                          "modelled. Section the mesh internally and cut it.")
+        except Exception:  # noqa: BLE001
+            pass
+
     passed = bool(cand.ok and cand.valid and cand.closed and
                   cand.deviation_mm <= tol and cand.reverse_max_mm <= tol and
-                  not hard_gap)
+                  not hard_gap and not void_gap)
     if cand.ok:
         print(f"colormaps: MISSING={cand.colormap_fwd_png}  "
               f"EXTRA={cand.colormap_png}   <- Read these images")
@@ -921,7 +958,8 @@ def _cli_run(args) -> int:
                        "volume_mm3": cand.volume_mm3, "valid": cand.valid,
                        "closed": cand.closed, "passed": passed,
                        "tolerance_mm": round(tol, 4),
-                       "feature_gaps": gaps, "metrics": cand.metrics}, fp, indent=2)
+                       "feature_gaps": gaps, "internal_void": void,
+                       "metrics": cand.metrics}, fp, indent=2)
         if args.out:
             from build123d import export_step
             os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
@@ -937,6 +975,9 @@ def _cli_run(args) -> int:
                        f" > {tol:.3f} mm")
         if hard_gap:
             why.append("missing editable features (above)")
+        if void_gap:
+            why.append(f"internal cavity not modelled "
+                       f"({100*void['missing_frac']:.1f}% void missing)")
         print(f"STATUS: FAIL  ({'; '.join(why)})" if why else "STATUS: FAIL")
     else:
         print(f"STATUS: {'PASS' if passed else 'FAIL'}")

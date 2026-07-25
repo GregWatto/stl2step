@@ -29,6 +29,94 @@ def size_tol(mesh, *, frac: float = 0.0015, floor: float = 0.03) -> float:
     return max(floor, frac * bbox_diagonal(mesh))
 
 
+def _section_areas(mesh, axis, coord):
+    """(filled_area, void_area) of the cross-section: solid area, and total
+    interior-hole (internal void) area. Void area isolates INTERNAL cavities from
+    outer-shape differences — comparing net filled area conflates the two, since
+    a small outer-radius error changes area a lot (∝ r²) and masks a cavity."""
+    from .draw import _section_polys, _poly_area
+    polys = _section_polys(mesh, axis, coord)
+    if not polys:
+        return 0.0, 0.0
+    filled = void = 0.0
+    for ext, ints in polys:
+        ext_a = _poly_area(ext)
+        holes = sum(_poly_area(i) for i in ints)
+        filled += max(0.0, ext_a - holes)
+        void += holes
+    return filled, void
+
+
+def internal_void_gap(target_mesh, cand_mesh, *, axis=None, n=48) -> dict | None:
+    """Compare INTERNAL VOID (hole) area of the part and candidate along an axis —
+    the internal-volume fidelity check the surface-distance metric lacks. If the
+    part is hollow (a chamber / channel / internal thread relief) where the
+    candidate is solid, the part's section has interior holes the candidate's
+    doesn't: `missing_void` is the cavity the candidate filled in solid (the
+    vortex failure). `extra_void` is the reverse. Uses only section hole areas, so
+    it is robust to a non-watertight mesh and to outer-shape error. Fractions are
+    relative to the part's solid volume, so the signal is scale-free."""
+    size = np.asarray(target_mesh.bounds[1]) - np.asarray(target_mesh.bounds[0])
+    if axis is None:
+        axis = int(np.argmax(size))
+    lo = float(target_mesh.bounds[0][axis]); hi = float(target_mesh.bounds[1][axis])
+    length = hi - lo
+    if length <= 1e-6:
+        return None
+    ds = length / n
+    missing = extra = filled = 0.0
+    for k in range(n):
+        c = lo + (k + 0.5) * ds
+        mf, mv = _section_areas(target_mesh, axis, c)
+        _cf, cv = _section_areas(cand_mesh, axis, c)
+        missing += max(0.0, mv - cv)     # part hollow here, candidate solid
+        extra += max(0.0, cv - mv)       # candidate hollow here, part solid
+        filled += mf
+    vol = filled * ds
+    return {"axis": "xyz"[axis], "part_volume_mm3": round(vol, 1),
+            "missing_void_mm3": round(missing * ds, 1),
+            "extra_void_mm3": round(extra * ds, 1),
+            "missing_frac": (missing / filled) if filled else 0.0,
+            "extra_frac": (extra / filled) if filled else 0.0}
+
+
+def internal_void_summary(mesh, *, n=64) -> dict | None:
+    """Quantify the part's OWN internal cavity so the brief can flag it up front:
+    total interior-void volume, its fraction of the solid volume, and the axial
+    band where it concentrates (where the chamber/channel is). A part with
+    significant internal void MUST be modelled hollow — this is the callout the
+    section renders imply but the structured analysis was missing."""
+    from .draw import _section_polys, _poly_area
+    size = np.asarray(mesh.bounds[1]) - np.asarray(mesh.bounds[0])
+    axis = int(np.argmax(size))
+    lo = float(mesh.bounds[0][axis]); hi = float(mesh.bounds[1][axis])
+    length = hi - lo
+    if length <= 1e-6:
+        return None
+    ds = length / n
+    voids = np.zeros(n); filled = 0.0
+    for k in range(n):
+        c = lo + (k + 0.5) * ds
+        polys = _section_polys(mesh, axis, c)
+        if not polys:
+            continue
+        for ext, ints in polys:
+            hole = sum(_poly_area(i) for i in ints)
+            voids[k] += hole
+            filled += max(0.0, _poly_area(ext) - hole)
+    void_vol = float(voids.sum() * ds)
+    filled_vol = float(filled * ds)
+    if filled_vol <= 0:
+        return None
+    hot = voids > 0.4 * voids.max() if voids.max() > 0 else np.zeros(n, bool)
+    coords = lo + (np.arange(n) + 0.5) * ds
+    band = ([round(float(coords[hot].min()), 1),
+             round(float(coords[hot].max()), 1)] if hot.any() else None)
+    return {"axis": "xyz"[axis], "void_mm3": round(void_vol, 1),
+            "void_frac": round(void_vol / filled_vol, 4),
+            "cavity_band_mm": band}
+
+
 def candidate_features(shape) -> dict:
     """Enumerate the analytic features actually present in a candidate BREP:
     cylinder faces (holes / bores / shafts), torus faces (fillets / rounds), cone
