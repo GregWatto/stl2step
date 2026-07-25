@@ -32,20 +32,27 @@ import trimesh
 
 @dataclass
 class DrawResult:
-    method: str               # "extrude" | "revolve"
+    method: str               # "extrude" | "revolve" | "prismatic" | "lofted"
     part: object              # build123d Part
     script: str               # feature-tree script
     summary: dict             # segment kind counts
     deviation: float          # p99 distance to the mesh (mm)
+    exact: bool = False        # True if it met dev_tol; False = best-effort
 
 
 def draw(mesh, *, dev_tol=0.1):
-    """Try to reconstruct `mesh` as a parametric feature model, cheapest model
-    first. Tier 1 is a single feature (extrusion / revolve) — the simplest, most
-    editable result, preferred whenever it fits. Tier 2 is a multi-level
-    prismatic stack (base + boss + pocket + step + holes). Every candidate is
-    built and verified against the mesh; returns the best passing result, or None
-    if nothing fits within `dev_tol` (caller falls back to BREP)."""
+    """Reconstruct `mesh` as a parametric feature model, cheapest model first
+    (single extrusion/revolve -> prismatic stack -> loft). Every candidate is
+    built and verified against the mesh.
+
+    Returns the first result that meets `dev_tol` (exact=True). If none does, it
+    does NOT throw the work away — it returns the closest valid feature model it
+    built (exact=False) so the CALLER can decide, with the deviation and colormap
+    in hand, whether that editable-but-approximate model beats a BREP fallback.
+    Only returns None when no recognizer produced a valid solid at all. This keeps
+    the accept/reject judgement with the agent, not a hard threshold buried here."""
+    built = []                 # every valid model built, for the best-effort return
+
     # Tier 1: single-feature recognizers.
     single = []
     for name, detect, build in (("extrude", detect_extrusion, draw_extrusion),
@@ -57,25 +64,29 @@ def draw(mesh, *, dev_tol=0.1):
             part, script, summary = build(spec, mesh=mesh)
             if part is None:
                 continue
-            single.append(DrawResult(name, part, script, summary,
-                                     _part_deviation(part, mesh)))
+            r = DrawResult(name, part, script, summary,
+                           _part_deviation(part, mesh))
+            single.append(r); built.append(r)
         except Exception:  # noqa: BLE001 — a recognizer failing is not fatal
             continue
     passing = [c for c in single if c.deviation <= dev_tol]
     if passing:
-        return min(passing, key=lambda c: c.deviation)
+        best = min(passing, key=lambda c: c.deviation)
+        best.exact = True
+        return best
 
-    # Tier 2: multi-feature prismatic stack. Try each candidate layering axis,
-    # build+verify, and return the first that passes (candidates are ordered so
-    # the most-decomposed stack is tried first).
+    # Tier 2: multi-feature prismatic stack (try each candidate layering axis).
     try:
         for pr in _prismatic_candidates(mesh):
             part, script, summary = draw_prismatic(pr, mesh=mesh, dev_tol=dev_tol)
             if part is None:
                 continue
             dev = _part_deviation(part, mesh)
+            r = DrawResult("prismatic", part, script, summary, dev)
+            built.append(r)
             if dev <= dev_tol:
-                return DrawResult("prismatic", part, script, summary, dev)
+                r.exact = True
+                return r
     except Exception:  # noqa: BLE001
         pass
 
@@ -86,11 +97,32 @@ def draw(mesh, *, dev_tol=0.1):
             part, script, summary = draw_lofted(lf, mesh=mesh, dev_tol=dev_tol)
             if part is not None:
                 dev = _part_deviation(part, mesh)
+                r = DrawResult("lofted", part, script, summary, dev)
+                built.append(r)
                 if dev <= dev_tol:
-                    return DrawResult("lofted", part, script, summary, dev)
+                    r.exact = True
+                    return r
     except Exception:  # noqa: BLE001
         pass
-    return None
+
+    # Best-effort: nothing hit tolerance. Return the closest valid feature model
+    # (exact=False) — but only if it's actually a reasonable reconstruction, so a
+    # gross mis-fit is not dressed up as an editable model; a wildly-off result is
+    # worse than an honest BREP. The agent still makes the final call from the
+    # colormap; this just filters out noise.
+    diag = float(np.linalg.norm(np.asarray(mesh.bounds[1]) - np.asarray(mesh.bounds[0])))
+    mesh_vol = float(mesh.volume) if mesh.is_watertight else None
+    valid = []
+    for r in built:
+        vol = float(getattr(r.part, "volume", 0) or 0)
+        if r.part is None or vol <= 0:
+            continue
+        if diag > 0 and r.deviation > 0.10 * diag:          # >10% of size: junk
+            continue
+        if mesh_vol and abs(vol - mesh_vol) > 0.25 * mesh_vol:   # volume way off
+            continue
+        valid.append(r)
+    return min(valid, key=lambda r: r.deviation) if valid else None
 
 
 # ----------------------------------------------------------------------------

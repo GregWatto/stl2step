@@ -40,9 +40,27 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.convert <PART.stl> -o <OUT.step> --
 
 If it prints `RESULT: PASS`, you're done: a single extrusion / revolve / prismatic
 stack / loft (continuously-varying section, e.g. a square-to-round adapter) was
-recognized and `<WORKDIR>/feature_tree.py` is the editable recipe. Show
-the user the metrics and the feature tree. Only continue below if it fell back to
-BREP (`method: solid`) or you want a cleaner feature model than BREP gives.
+recognized and `<WORKDIR>/feature_tree.py` is the editable recipe. Show the user
+the metrics and the feature tree — you're done.
+
+If it prints `RESULT: APPROX`, a recognizer built a valid, **editable** feature
+model that captures the structure but is over the 0.1 mm bar (deviation is
+printed) — the tool surfaces it instead of silently dropping to BREP, because the
+accept/refine decision is YOURS. Read the colormaps it wrote
+(`<WORKDIR>/draw_missing.png` = red where a feature is missing, `draw_extra.png` =
+red where material is extra) and decide:
+- deviation is tiny (≲ a few tenths mm) or the residual is inherent detail
+  (fillets, a rim) → run the **fitter** (step 5b) on `feature_tree.py`; it usually
+  clears the last bit. Keep it if it's faithful.
+- a specific feature is missing/extra (a clear red blob — a bore, a pocket) →
+  start from `feature_tree.py` as your base and **refine** via the compose loop
+  (steps 3–5): add that one feature, re-verify.
+- the model is poor (large scattered red, wrong structure) → fall back to the
+  exact BREP: `convert ... --method solid`.
+
+Continue to the compose path below when convert fell back to BREP
+(`method: solid`), when you judged an `APPROX` model needs feature-level
+refinement, or when you want a cleaner feature model than BREP gives.
 
 ### 2. Build the brief (analysis + rendered views)
 

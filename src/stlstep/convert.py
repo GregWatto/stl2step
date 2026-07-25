@@ -38,15 +38,22 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
     if method in ("auto", "draw", "full"):
         from . import draw as dw
         res = dw.draw(ing.mesh)
-        escalation.append("draw:" + ("hit" if res is not None else "miss"))
-        if res is not None:
+        if res is None:
+            escalation.append("draw:miss")
+        else:
+            escalation.append("draw:hit" if res.exact else "draw:approx")
+
+        # Exact -> take it. Approximate -> surface it to the agent (auto/draw) so
+        # it can judge the editable model against BREP from the colormap; the
+        # autonomous 'full' path instead escalates to compose to try for better.
+        if res is not None and (res.exact or method in ("auto", "draw")):
             out = _finish_draw(res, ing, stl_path, step_path, report_dir, t0)
             out["escalation"] = escalation
             return out
         if method == "draw":
             return {"input": stl_path, "output": step_path, "method": "draw",
                     "drawn": False,
-                    "note": "not a single-feature (extrude/revolve) part",
+                    "note": "no recognizer produced a valid feature model",
                     "elapsed_s": round(time.time() - t0, 2)}
 
         # 'full' — the autonomous driver: escalate to the LLM composition loop
@@ -72,6 +79,13 @@ def convert(stl_path: str, step_path: str, *, method: str = "auto",
                     out = _finish_compose(cres, ing, stl_path, step_path, workdir, t0)
                     out["escalation"] = escalation
                     return out
+            # compose didn't pass either: an editable approximate feature model
+            # still beats faceted BREP triangle-soup, so prefer it if we have one.
+            if res is not None:
+                escalation.append("draw:approx-kept")
+                out = _finish_draw(res, ing, stl_path, step_path, report_dir, t0)
+                out["escalation"] = escalation
+                return out
 
         method = "solid"   # auto/full: fall back to the BREP path
 
@@ -164,12 +178,31 @@ def _finish_draw(res, ing, stl_path, step_path, report_dir, t0) -> dict:
         "brep_face_count": ou.count_faces(shape),
         "valid": ou.is_valid(shape),
         "closed": is_solid,
+        "exact": bool(res.exact),
         "passed": bool(res.deviation <= 0.1 and ou.is_valid(shape) and is_solid),
     }
+    if not result["passed"]:
+        result["note"] = (
+            f"approximate feature model (deviation {res.deviation:.2f} mm): an "
+            f"editable feature tree that captures the structure but not every "
+            f"sub-mm detail. Inspect the colormaps and decide whether to keep it, "
+            f"refine it (compose), or take the exact BREP (--method solid).")
     if report_dir:
         os.makedirs(report_dir, exist_ok=True)
         with open(os.path.join(report_dir, "feature_tree.py"), "w") as fp:
             fp.write(res.script)
+        # colormaps so the agent can see WHERE any residual deviation is
+        try:
+            import trimesh
+            from . import verify
+            rv, rf = ou.shape_to_mesh(shape, 0.05)
+            gen = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+            result["colormap_missing"] = verify.render_colormap(
+                ing.mesh, gen, os.path.join(report_dir, "draw_missing.png"))
+            result["colormap_extra"] = verify.render_colormap(
+                gen, ing.mesh, os.path.join(report_dir, "draw_extra.png"))
+        except Exception:  # noqa: BLE001 — colormaps are a convenience, not vital
+            pass
         with open(os.path.join(report_dir, "report.json"), "w") as fp:
             json.dump(result, fp, indent=2, default=str)
     result["feature_script"] = res.script
@@ -281,8 +314,13 @@ def main(argv=None) -> int:
               f"closed={result['closed']}")
         print(f"  deviation p99={result['deviation_p99_mm']}mm  "
               f"volume {result['volume_mm3']} vs mesh {result['mesh_volume_mm3']}")
-        print(f"  RESULT: {'PASS' if result['passed'] else 'FAIL'}  "
-              f"(feature_tree.py written to report dir)")
+        if result["passed"]:
+            print("  RESULT: PASS  (feature_tree.py written to report dir)")
+        else:
+            print(f"  RESULT: APPROX  (editable feature model, "
+                  f"{result['deviation_p99_mm']}mm; feature_tree.py + colormaps "
+                  f"in report dir)")
+            print(f"  {result.get('note', '')}")
         return 0 if result["passed"] else 1
     if result.get("drawn") is False:             # draw-only requested, failed
         print(f"[{name}] draw failed: {result['note']}")
