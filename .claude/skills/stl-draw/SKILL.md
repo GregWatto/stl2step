@@ -120,6 +120,30 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile2d <PART.stl> --axis z
 When a colormap later flags a region, come back here: probe that exact region's
 real geometry and match it, rather than iterating on a guessed shape.
 
+**Threads: identify the SPEC, model the NOMINAL.** If a hole/stud wall shows a
+sawtooth in the sections or a helical band (the `slicepics` zoom makes them
+obvious), identify it:
+
+```
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe thread <PART.stl> --axis z --center=-64.5,6 --range 0.5,8 --r 6.3   # add --stud for external
+```
+
+It measures minor/major Ø, pitch, and taper, and matches ISO metric + common
+UNC/UNF (a tapered result means a pipe thread — NPT/BSPT). Then follow real CAD
+convention — a thread's mesh geometry is the *evidence*, the spec is the
+*intent*:
+- **Threaded hole** → model a plain hole at the **minor Ø** (tap-drill
+  representation), and record the spec as a comment in attempt.py
+  (`# M10x1.5 threaded hole — modelled at tap Ø8.5`) and in your final summary.
+  The engineer re-applies Thread(M10x1.5) in Fusion in seconds *because the spec
+  is known*.
+- **Threaded stud** → plain cylinder at the **major (nominal) Ø**, spec recorded.
+- **Never surface-fit the helix.** Residual deviation confined to an identified
+  thread band (~half the thread depth) is expected — state it with the spec in
+  the final summary instead of chasing it. Modeled 3D threads (for printing) are
+  possible via `bd_warehouse`'s IsoThread if the user asks — it is not installed
+  by default.
+
 **"Curves" are usually flat facets + fillets.** Before you approximate a curved
 region with boxes, run `normals`: if a handful of clusters cover ~90% of the area,
 the surface is flat facets meeting at angles, joined by small fillets — NOT a true

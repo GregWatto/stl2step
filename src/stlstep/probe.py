@@ -385,6 +385,49 @@ def cmd_slicepics(m: trimesh.Trimesh, args) -> dict:
     return result
 
 
+def cmd_thread(m: trimesh.Trimesh, args) -> dict:
+    """Identify a thread on a cylindrical wall band: measured minor/major
+    diameter, pitch (helix period), taper (pipe threads), and the closest
+    standard spec (ISO metric + common UNC/UNF). The mesh geometry is the
+    evidence; the SPEC is the intent — model the nominal hole/stud and record
+    the spec rather than surface-fitting the helix."""
+    from .features import thread_signature
+    ai = _axis(args.axis)
+    u, v = _perp(ai)
+    cu, cv = (float(x) for x in args.center.split(","))
+    pt = [0.0, 0.0, 0.0]
+    pt[u], pt[v] = cu, cv
+    t_range = None
+    if args.range:
+        r = [float(x) for x in args.range.split(",")]
+        if len(r) != 2:
+            raise SystemExit("--range needs lo,hi (use = form for negatives)")
+        t_range = (r[0], r[1])
+    sig = thread_signature(m, [1.0 if i == ai else 0.0 for i in (0, 1, 2)], pt,
+                           t_range=t_range, r_hint=args.r,
+                           internal=not args.stud)
+    out = {"axis": args.axis, "center": [cu, cv], "signature": sig}
+    if not args.json:
+        if sig is None:
+            print("no thread signature (plain wall, or wrong axis/center/band)")
+        else:
+            kind = "external (stud)" if args.stud else "internal (hole)"
+            print(f"THREAD detected ({kind}):")
+            print(f"  measured: Ø{sig['minor_diameter_mm']}..Ø"
+                  f"{sig['major_diameter_mm']}  pitch {sig['pitch_mm']} mm  "
+                  f"depth {sig['depth_mm']}  taper {sig['taper_deg']}°")
+            if sig.get("spec"):
+                print(f"  closest standard: {sig['spec']}  "
+                      f"(D={sig['spec_major_mm']}, P={sig['spec_pitch_mm']})")
+                print("  -> model the NOMINAL feature (hole at minor Ø / stud at "
+                      "major Ø) and record the spec; do not surface-fit the helix")
+            elif sig.get("spec_note"):
+                print(f"  {sig['spec_note']}")
+            else:
+                print("  no standard table match — report the measured numbers")
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="stlstep.probe",
@@ -453,6 +496,20 @@ def main(argv=None) -> int:
     sp.add_argument("--n", type=int, default=8, help="slices across --range")
     sp.add_argument("--out", default=None, help="output PNG path")
     sp.set_defaults(fn=cmd_slicepics)
+
+    tr = sub.add_parser("thread", help="identify a thread (pitch, Ø, standard "
+                                       "spec) on a hole/stud wall band")
+    tr.add_argument("stl"); tr.add_argument("--axis", required=True)
+    tr.add_argument("--center", required=True,
+                    help="u,v of the axis in the perpendicular plane "
+                         "(use --center=-64.5,6 for negatives)")
+    tr.add_argument("--range", default=None,
+                    help="axial band lo,hi along the axis")
+    tr.add_argument("--r", type=float, default=None,
+                    help="approximate wall radius (mm) — tightens the search")
+    tr.add_argument("--stud", action="store_true",
+                    help="external thread (stud/bolt) instead of a hole")
+    tr.set_defaults(fn=cmd_thread)
 
     args = p.parse_args(argv)
     m = _load(args.stl)

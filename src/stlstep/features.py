@@ -291,3 +291,165 @@ def _degenerate(surfaces, diag) -> list[dict]:
             out.append({"kind": "torus", "major_radius_mm": s["major_radius_mm"],
                         "reason": "major radius ~ part size; likely a mis-fit"})
     return out
+
+
+# ----------------------------------------------------------------------------
+# Thread identification.
+#
+# A thread in a mesh is a helical wall: the radius about the axis oscillates
+# between minor and major with period = pitch. The INTENT, though, is a spec
+# (M10x1.5) — real CAD models threads as a spec'd feature on a nominal hole/
+# stud, not as helical geometry. So the job here is identification: measure
+# depth (r spread in the wall band), pitch (axial spacing of crest passes in
+# fixed angular sectors — robust, no unwrapping), and taper (pipe threads),
+# then match against standard tables. Modelling policy lives in the skill:
+# nominal representation + recorded spec.
+# ----------------------------------------------------------------------------
+
+# (nominal D mm, pitch mm, name) — ISO metric coarse + common fine.
+ISO_THREADS = [
+    (2.0, 0.4, "M2"), (2.5, 0.45, "M2.5"), (3.0, 0.5, "M3"), (4.0, 0.7, "M4"),
+    (5.0, 0.8, "M5"), (6.0, 1.0, "M6"), (8.0, 1.25, "M8"), (8.0, 1.0, "M8x1"),
+    (10.0, 1.5, "M10"), (10.0, 1.25, "M10x1.25"), (10.0, 1.0, "M10x1"),
+    (12.0, 1.75, "M12"), (12.0, 1.5, "M12x1.5"), (12.0, 1.25, "M12x1.25"),
+    (14.0, 2.0, "M14"), (14.0, 1.5, "M14x1.5"), (16.0, 2.0, "M16"),
+    (16.0, 1.5, "M16x1.5"), (20.0, 2.5, "M20"), (24.0, 3.0, "M24"),
+]
+# (major D mm, pitch mm, name) — a few common inch threads (UNC/UNF).
+INCH_THREADS = [
+    (6.35, 1.270, '1/4-20 UNC'), (6.35, 0.907, '1/4-28 UNF'),
+    (7.94, 1.411, '5/16-18 UNC'), (9.53, 1.588, '3/8-16 UNC'),
+    (12.70, 1.954, '1/2-13 UNC'), (12.70, 1.270, '1/2-20 UNF'),
+]
+
+
+def thread_signature(mesh, axis_dir, axis_pt, *, t_range=None, r_hint=None,
+                     internal=None):
+    """Measure a thread signature on a cylindrical wall band. Returns None if
+    the wall reads as plain (no consistent helical oscillation), else a dict
+    with measured minor/major diameter, pitch, taper, and the closest standard
+    spec (or measured-only if nothing matches)."""
+    d = np.asarray(axis_dir, dtype=float); d /= np.linalg.norm(d)
+    p0 = np.asarray(axis_pt, dtype=float)
+    V = np.asarray(mesh.vertices)
+    rel = V - p0
+    t = rel @ d
+    radial = rel - t[:, None] * d[None]
+    r = np.linalg.norm(radial, axis=1)
+
+    sel = np.ones(len(V), dtype=bool)
+    if t_range is not None:
+        sel &= (t >= t_range[0]) & (t <= t_range[1])
+    if r_hint is not None:
+        sel &= np.abs(r - r_hint) < max(1.5, 0.25 * r_hint)
+    else:
+        sel &= r > 1e-6
+    if sel.sum() < 120:
+        return None
+    rb, tb = r[sel], t[sel]
+    # wall band: mode of the radius histogram, expanded while populated — keeps
+    # the thread band, drops chamfers/counterbores at other radii
+    binw = 0.15
+    bins = np.arange(rb.min(), rb.max() + binw, binw)
+    hist, edges = np.histogram(rb, bins=bins)
+    k = int(np.argmax(hist))
+    # steep cutoff (0.35 of peak): the thread band is a dense plateau; adjacent
+    # features (a counterbore wall, a recess) show as separate spikes that a
+    # looser threshold would wrongly merge into the band
+    lo_k, hi_k = k, k
+    while lo_k > 0 and hist[lo_k - 1] > 0.35 * hist[k]:
+        lo_k -= 1
+    while hi_k < len(hist) - 1 and hist[hi_k + 1] > 0.35 * hist[k]:
+        hi_k += 1
+    wall = (rb >= edges[lo_k]) & (rb < edges[hi_k + 1])
+    if wall.sum() < 120:
+        return None
+    rw, tw = rb[wall], tb[wall]
+    rad_w = radial[sel][wall]
+    th = np.arctan2(rad_w[:, 1], rad_w[:, 0])
+    # robust 10/90 percentiles: entry chamfers / an adjacent recess pollute
+    # the tails and would fake a too-deep thread
+    r_lo, r_hi = float(np.percentile(rw, 10)), float(np.percentile(rw, 90))
+    depth = r_hi - r_lo
+    if depth < 0.15:
+        return None                       # plain wall, no thread relief
+
+    # pitch: within a fixed angular sector, crest passes sit at z spaced by
+    # exactly P. Estimate the period per sector from the FIRST strong peak of
+    # the pairwise z-difference histogram (robust for both dense grids and
+    # sparse decimated meshes — no clustering or unwrapping needed).
+    peaks, all_dd = [], []
+    for kk in range(8):
+        a0 = -np.pi + kk * np.pi / 4
+        sec = (th >= a0) & (th < a0 + np.pi / 4) & (rw < r_lo + 0.25 * depth)
+        zs = tw[sec]
+        if len(zs) < 4:
+            continue
+        if len(zs) > 300:
+            zs = np.random.default_rng(0).choice(zs, 300, replace=False)
+        dd = np.abs(zs[:, None] - zs[None, :])[np.triu_indices(len(zs), 1)]
+        dd = dd[(dd > 0.25) & (dd < 10.0)]
+        if len(dd) < 6:
+            continue
+        all_dd.append(dd)
+        hist, edges = np.histogram(dd, bins=np.arange(0.25, 10.0, 0.05))
+        if hist.max() < 3:
+            continue
+        idx = np.where(hist >= 0.6 * hist.max())[0]
+        first = int(idx[0])                     # fundamental, not a multiple
+        lo_b, hi_b = max(0, first - 2), first + 3
+        w = hist[lo_b:hi_b].astype(float)
+        c = 0.5 * (edges[lo_b:hi_b] + edges[lo_b + 1:hi_b + 1])
+        peaks.append(float((w * c).sum() / w.sum()))
+    if len(peaks) < 3:      # tolerate partial circumferential exposure
+        return None
+    peaks = np.asarray(peaks)
+    p0 = float(np.median(peaks))
+    spread = float(np.percentile(peaks, 75) - np.percentile(peaks, 25))
+    if p0 <= 0 or spread > 0.2 * p0:
+        return None                       # sectors disagree -> not a helix
+    # refine with the harmonics: the pairwise-difference histogram peaks at
+    # every multiple of P; the centroid at k*P divided by k averages away the
+    # single-peak bias, giving pitch to ~1-2%
+    dd = np.concatenate(all_dd)
+    refined = []
+    for kmul in (1, 2, 3, 4):
+        w = dd[np.abs(dd - kmul * p0) < 0.3 * p0]
+        if len(w) >= 6:
+            refined.append(float(np.mean(w)) / kmul)
+    pitch = float(np.median(refined)) if refined else p0
+    # sanity: ISO thread depth ~ 0.54..0.65 * P
+    if not (0.15 * pitch < depth < 1.4 * pitch):
+        return None
+
+    # taper (pipe threads): slope of the outer envelope along the axis
+    hi_band = rw > r_hi - 0.3 * depth
+    taper_deg = 0.0
+    if hi_band.sum() > 10 and np.ptp(tw[hi_band]) > 1e-6:
+        slope = float(np.polyfit(tw[hi_band], rw[hi_band], 1)[0])
+        taper_deg = float(np.degrees(np.arctan(slope)))
+
+    major = 2 * r_hi
+    out = {"minor_diameter_mm": round(2 * r_lo, 3),
+           "major_diameter_mm": round(major, 3),
+           "pitch_mm": round(pitch, 3),
+           "depth_mm": round(depth, 3),
+           "taper_deg": round(taper_deg, 2),
+           "internal": internal,
+           "spec": None}
+    if abs(taper_deg) > 1.0:
+        out["spec_note"] = ("tapered — likely a PIPE thread (NPT/BSPT); "
+                            "match by hand")
+        return out
+    best = None
+    for D, P, name in ISO_THREADS + INCH_THREADS:
+        if abs(P - pitch) > 0.12 * P:
+            continue
+        dD = abs(D - major)
+        if dD < 0.6 and (best is None or dD < best[0]):
+            best = (dD, D, P, name)
+    if best:
+        out["spec"] = best[3]
+        out["spec_major_mm"] = best[1]
+        out["spec_pitch_mm"] = best[2]
+    return out
