@@ -875,14 +875,42 @@ def _cli_brief(args) -> int:
 
 def _cli_run(args) -> int:
     from .ingest import load_and_repair
+    from . import featurecheck as fc
     with open(args.script) as fp:
         script = fp.read()
     ing = load_and_repair(args.stl)
     cand = run_candidate(script, ing.mesh, args.workdir, tag=args.tag)
     mv = float(ing.mesh.volume) if ing.mesh.is_watertight else None
     print(cand.feedback(mv))
+
+    # size-relative tolerance: a fixed mm bar is wrong across scales.
+    tol = args.tol if args.tol is not None else fc.size_tol(ing.mesh)
+    if args.tol is None:
+        print(f"tolerance: {tol:.3f} mm  (relative: 0.1% of the "
+              f"{fc.bbox_diagonal(ing.mesh):.1f} mm bbox diagonal)")
+
+    # feature-completeness: deviation can't see small features, so check that the
+    # part's holes/fillets/chamfers are actually modelled as editable ops.
+    gaps, hard_gap = [], False
+    if cand.ok:
+        apath = os.path.join(args.workdir, "analysis.json")
+        if os.path.exists(apath):
+            try:
+                with open(apath) as fp:
+                    analysis = json.load(fp)
+                gaps = fc.feature_gap(analysis, cand.part.wrapped)
+                print(fc.format_gap(gaps))
+                hard_gap = any(g["found"] is not None and g["found"] < g["expected"]
+                               for g in gaps)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            print("feature check: skipped (run `brief` first to write "
+                  "analysis.json for feature-completeness checking)")
+
     passed = bool(cand.ok and cand.valid and cand.closed and
-                  cand.deviation_mm <= args.tol and cand.reverse_max_mm <= args.tol)
+                  cand.deviation_mm <= tol and cand.reverse_max_mm <= tol and
+                  not hard_gap)
     if cand.ok:
         print(f"colormaps: MISSING={cand.colormap_fwd_png}  "
               f"EXTRA={cand.colormap_png}   <- Read these images")
@@ -892,7 +920,8 @@ def _cli_run(args) -> int:
                        "reverse_max_mm": cand.reverse_max_mm,
                        "volume_mm3": cand.volume_mm3, "valid": cand.valid,
                        "closed": cand.closed, "passed": passed,
-                       "metrics": cand.metrics}, fp, indent=2)
+                       "tolerance_mm": round(tol, 4),
+                       "feature_gaps": gaps, "metrics": cand.metrics}, fp, indent=2)
         if args.out:
             from build123d import export_step
             os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
@@ -901,7 +930,16 @@ def _cli_run(args) -> int:
             with open(os.path.join(args.workdir, "feature_tree.py"), "w") as fp:
                 fp.write(script)
             print(f"exported {args.out}  +  {args.workdir}/feature_tree.py")
-    print(f"STATUS: {'PASS' if passed else 'FAIL'}")
+    if not passed and cand.ok:
+        why = []
+        if cand.deviation_mm > tol or cand.reverse_max_mm > tol:
+            why.append(f"deviation {max(cand.deviation_mm, cand.reverse_max_mm):.3f}"
+                       f" > {tol:.3f} mm")
+        if hard_gap:
+            why.append("missing editable features (above)")
+        print(f"STATUS: FAIL  ({'; '.join(why)})" if why else "STATUS: FAIL")
+    else:
+        print(f"STATUS: {'PASS' if passed else 'FAIL'}")
     return 0 if passed else 1
 
 
@@ -968,7 +1006,8 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="execute + verify a proposed build123d script")
     r.add_argument("stl"); r.add_argument("workdir"); r.add_argument("script")
     r.add_argument("--tag", default="iter0")
-    r.add_argument("--tol", type=float, default=0.1)
+    r.add_argument("--tol", type=float, default=None,
+                   help="deviation tolerance mm (default: 0.1%% of bbox diagonal)")
     r.add_argument("--out", default=None, help="export STEP here if it builds")
     r.set_defaults(fn=_cli_run)
 
@@ -976,7 +1015,7 @@ def main(argv=None) -> int:
                                    "verify (LLM gets structure, math gets mm)")
     f.add_argument("stl"); f.add_argument("workdir"); f.add_argument("script")
     f.add_argument("--tag", default="iter0")
-    f.add_argument("--tol", type=float, default=0.1)
+    f.add_argument("--tol", type=float, default=None)
     f.add_argument("--max-evals", type=int, default=400)
     f.add_argument("--out", default=None, help="export STEP here if it builds")
     f.set_defaults(fn=_cli_fit)

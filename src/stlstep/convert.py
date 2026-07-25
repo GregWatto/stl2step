@@ -179,7 +179,8 @@ def _finish_draw(res, ing, stl_path, step_path, report_dir, t0) -> dict:
         "valid": ou.is_valid(shape),
         "closed": is_solid,
         "exact": bool(res.exact),
-        "passed": bool(res.deviation <= 0.1 and ou.is_valid(shape) and is_solid),
+        # res.exact already reflects the size-relative tolerance from draw()
+        "passed": bool(res.exact and ou.is_valid(shape) and is_solid),
     }
     if not result["passed"]:
         result["note"] = (

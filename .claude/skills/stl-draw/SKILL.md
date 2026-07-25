@@ -173,11 +173,28 @@ Read the printed metrics, then **Read both colormaps**:
 The metric alone can lie — always look at BOTH colormaps and the volume, not one
 number. A valid, closed solid with matching volume can still be missing a feature.
 
-### 5. Refine
+**Deviation cannot see small features, so `run` also prints a feature check.**
+Because a missing fillet/hole/chamfer barely moves the distance metric, the verify
+step enumerates the part's real features (from `analysis.json`) and checks your
+model actually contains them, printing `MISSING FEATURES` for any hole/boss/fillet/
+chamfer that isn't modelled. **This is the anti-"stop too soon" gate:** a matching
+*shape* is worthless to an engineer who needs to edit those features. `STATUS: PASS`
+now requires deviation under a **size-relative** tolerance (0.1% of the bbox
+diagonal — printed each run — so 1 mm counts as huge on a small part) AND no
+missing hole/boss/fillet. (Chamfers are flagged as a reminder, not a hard block;
+the feature detector is approximate, so if a flagged feature is verifiably NOT on
+the part — check the render/sections — note that and move on. But never ignore a
+real one.)
 
-Fix the largest red regions, bump the `--tag` (iter1, iter2, …), and re-run step 4.
-Target: max deviation and reverse both `< 0.1 mm`, valid closed solid, volume
-matching the mesh.
+### 5. Refine — model the FEATURES, don't settle for the shape
+
+Fix the largest red regions AND clear every `MISSING FEATURES` line — add the
+holes (`Hole`/`Circle`+SUBTRACT), bosses, and rounded edges (`fillet(...)`,
+`chamfer(...)`) as real, editable operations. Bump the `--tag` (iter1, iter2, …)
+and re-run step 4. Done = `STATUS: PASS`: deviation and reverse both under the
+printed size-relative tolerance, a valid closed solid, volume matching, and no
+un-modelled features. A "faithful-looking" solid that still lists missing features
+is NOT done — keep going.
 
 ### 5b. Snap dimensions with the parameter fitter
 
@@ -194,8 +211,10 @@ them (Powell) to minimise deviation to the mesh — snapping radii, positions,
 depths, and offsets to their true values (it fixed a plate+hole from 4.0 mm to
 0.014 mm, recovering an exact hole position from a 3.6 mm error). It writes
 `attempt_fitted.py` and verifies + exports it. If the structure is right, this is
-usually what takes you across the `< 0.1 mm` line. If it does NOT help much, your
-feature structure is wrong (a missing/extra feature) — go back to step 5, not fit.
+usually what takes you under the size-relative tolerance. If it does NOT help
+much, your feature structure is wrong (a missing/extra feature) — go back to step
+5, not fit. Fit snaps dimensions; it cannot add a feature you never modelled, so
+clear the `MISSING FEATURES` list first.
 
 ### 6. Final visual gate (structural check before you declare done)
 

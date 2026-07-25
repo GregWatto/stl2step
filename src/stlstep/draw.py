@@ -40,7 +40,7 @@ class DrawResult:
     exact: bool = False        # True if it met dev_tol; False = best-effort
 
 
-def draw(mesh, *, dev_tol=0.1):
+def draw(mesh, *, dev_tol=None):
     """Reconstruct `mesh` as a parametric feature model, cheapest model first
     (single extrusion/revolve -> prismatic stack -> loft). Every candidate is
     built and verified against the mesh.
@@ -50,7 +50,13 @@ def draw(mesh, *, dev_tol=0.1):
     built (exact=False) so the CALLER can decide, with the deviation and colormap
     in hand, whether that editable-but-approximate model beats a BREP fallback.
     Only returns None when no recognizer produced a valid solid at all. This keeps
-    the accept/reject judgement with the agent, not a hard threshold buried here."""
+    the accept/reject judgement with the agent, not a hard threshold buried here.
+
+    `dev_tol` defaults to a SIZE-RELATIVE bar (a fixed mm is too slack for a small
+    part, too strict for a big one)."""
+    if dev_tol is None:
+        from .featurecheck import size_tol
+        dev_tol = size_tol(mesh)
     built = []                 # every valid model built, for the best-effort return
 
     # Tier 1: single-feature recognizers.
