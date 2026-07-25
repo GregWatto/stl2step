@@ -919,35 +919,53 @@ def _cli_run(args) -> int:
             print("feature check: skipped (run `brief` first to write "
                   "analysis.json for feature-completeness checking)")
 
-    # internal-void fidelity: the surface-distance metric barely penalises a
-    # filled-in internal cavity (a chamber / channel / internal thread relief), so
-    # check it directly by comparing cross-section hole area. Catches "the model
-    # is solid where the part is hollow" — the vortex failure.
-    void = None
-    void_gap = False
+    # slice-occupancy: the volumetric-truth check. Surface distance measures how
+    # close the skins are; this slices BOTH solids along all three axes and
+    # intersects the filled regions, so it directly measures whether the same 3D
+    # space is solid — catching filled-in internal cavities, dropped pockets, and
+    # oversize/undersize material that surface metrics under-report. Robust to a
+    # non-watertight mesh, and it localises every divergence to a slice + region.
+    occ = None
+    occ_gap = False
     if cand.ok:
         try:
             from . import occ_util as ou
             rv, rf = ou.shape_to_mesh(cand.part.wrapped, 0.1)
             cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
-            void = fc.internal_void_gap(ing.mesh, cg)
-            if void:
-                print(f"internal void: candidate MISSING "
-                      f"{void['missing_void_mm3']}mm^3 "
-                      f"({100*void['missing_frac']:.1f}%) of the part's internal "
-                      f"cavity; EXTRA void {void['extra_void_mm3']}mm^3 "
-                      f"({100*void['extra_frac']:.1f}%)")
-                void_gap = void["missing_frac"] > 0.03
-                if void_gap:
-                    print("  ^ the part is HOLLOW where your model is SOLID — an "
-                          "internal cavity/chamber/channel/thread-relief is not "
-                          "modelled. Section the mesh internally and cut it.")
+            occ = fc.slice_occupancy(ing.mesh, cg)
+            if occ and occ.get("mean_iou") is not None:
+                print(f"slice occupancy (solid-vs-void, 3 axes): mean IoU "
+                      f"{occ['mean_iou']}  |  MISSING material {occ['missing_mm3']}"
+                      f"mm^3 ({100*occ['missing_frac']:.1f}%)  EXTRA material "
+                      f"{occ['extra_mm3']}mm^3 ({100*occ['extra_frac']:.1f}%)")
+                if occ["void_missing_frac"] > 0.02:
+                    print(f"  internal cavity filled solid: "
+                          f"{occ['void_missing_mm3']}mm^3 "
+                          f"({100*occ['void_missing_frac']:.1f}%) — the part is "
+                          f"HOLLOW where your model is SOLID. Section the cavity "
+                          f"band and cut it (Mode.SUBTRACT).")
+                if occ["worst_slices"]:
+                    print("  worst slices (fix these first — probe the section "
+                          "at each coordinate):")
+                    for w in occ["worst_slices"][:5]:
+                        loc = (f"  region {w['region_uv_bounds']}"
+                               if w.get("region_uv_bounds") else "")
+                        print(f"    {w['axis']}={w['at_mm']}  IoU {w['iou']}  "
+                              f"missing {w['missing_mm2']}mm^2  extra "
+                              f"{w['extra_mm2']}mm^2{loc}")
+                spng = fc.render_slice_report(
+                    ing.mesh, cg, occ,
+                    os.path.join(args.workdir, f"{args.tag}_slices.png"))
+                if spng:
+                    print(f"slice report: {spng}   <- Read this image (grey=match, "
+                          f"red=missing, blue=extra, per worst slice)")
+                occ_gap = (occ["missing_frac"] > 0.03 or occ["extra_frac"] > 0.03)
         except Exception:  # noqa: BLE001
             pass
 
     passed = bool(cand.ok and cand.valid and cand.closed and
                   cand.deviation_mm <= tol and cand.reverse_max_mm <= tol and
-                  not hard_gap and not void_gap)
+                  not hard_gap and not occ_gap)
     if cand.ok:
         print(f"colormaps: MISSING={cand.colormap_fwd_png}  "
               f"EXTRA={cand.colormap_png}   <- Read these images")
@@ -958,7 +976,9 @@ def _cli_run(args) -> int:
                        "volume_mm3": cand.volume_mm3, "valid": cand.valid,
                        "closed": cand.closed, "passed": passed,
                        "tolerance_mm": round(tol, 4),
-                       "feature_gaps": gaps, "internal_void": void,
+                       "feature_gaps": gaps,
+                       "slice_occupancy": ({k: v for k, v in occ.items()
+                                            if k != "per_axis"} if occ else None),
                        "metrics": cand.metrics}, fp, indent=2)
         if args.out:
             from build123d import export_step
@@ -975,9 +995,11 @@ def _cli_run(args) -> int:
                        f" > {tol:.3f} mm")
         if hard_gap:
             why.append("missing editable features (above)")
-        if void_gap:
-            why.append(f"internal cavity not modelled "
-                       f"({100*void['missing_frac']:.1f}% void missing)")
+        if occ_gap:
+            why.append(f"occupancy mismatch (missing "
+                       f"{100*occ['missing_frac']:.1f}% / extra "
+                       f"{100*occ['extra_frac']:.1f}% of the part's volume — "
+                       f"see the worst slices + slice report)")
         print(f"STATUS: FAIL  ({'; '.join(why)})" if why else "STATUS: FAIL")
     else:
         print(f"STATUS: {'PASS' if passed else 'FAIL'}")

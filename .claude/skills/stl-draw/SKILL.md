@@ -185,6 +185,20 @@ Read the printed metrics, then **Read both colormaps**:
 The metric alone can lie — always look at BOTH colormaps and the volume, not one
 number. A valid, closed solid with matching volume can still be missing a feature.
 
+**`run` also prints SLICE OCCUPANCY — the volumetric-truth check.** Surface
+deviation measures how close the skins are; occupancy slices BOTH solids along
+all three axes and intersects the filled regions, so it measures whether the same
+3D space is actually solid — catching filled-in internal cavities, dropped
+pockets, and oversize/undersize material that surface metrics under-report (and
+it works on non-watertight meshes). It prints mean IoU, missing/extra material as
+% of the part's volume, an explicit "internal cavity filled solid" callout when
+your model is solid where the part is hollow, and the **worst slices with their
+coordinates and 2D region bounds** — then writes `<tag>_slices.png` (grey=match,
+red=missing material, blue=extra). **Read that image**; fix the worst slices
+first, using `probe sections --axis <a> --at=<coord>` at exactly those
+coordinates to read the true geometry there. PASS requires missing AND extra
+under 3% of the part's volume.
+
 **Deviation cannot see small features, so `run` also prints a feature check.**
 Because a missing fillet/hole/chamfer barely moves the distance metric, the verify
 step enumerates the part's real features (from `analysis.json`) and checks your
@@ -254,8 +268,12 @@ When `STATUS: PASS`, the `run --out` step has exported the STEP and written
 `<WORKDIR>/feature_tree.py` — the editable feature recipe. Show the user the final
 metrics, the feature tree, and where the STEP is.
 
-If it won't converge after ~4 iterations (e.g. a genuinely freeform/organic body),
-say so plainly and fall back to the BREP solid:
+If it won't converge after several iterations, first ask WHY before falling back:
+almost every mechanical part IS buildable from base features (extrude / revolve /
+loft / hole / fillet / chamfer + cuts) — "hard" usually means a feature you
+haven't measured yet, not an unbuildable part. BREP is acceptable ONLY for a
+genuinely organic/freeform region (sculpted blends, scanned surfaces) — never as
+a substitute for modelling ordinary features. The whole-part fallback is:
 `PYTHONPATH=src ./.venv/bin/python -m stlstep.convert <PART.stl> -o <OUT.step> --method solid --report <WORKDIR>`
 
 ## Principles (from this project's hard-won lessons)

@@ -80,6 +80,281 @@ def internal_void_gap(target_mesh, cand_mesh, *, axis=None, n=48) -> dict | None
             "extra_frac": (extra / filled) if filled else 0.0}
 
 
+# ----------------------------------------------------------------------------
+# Slice-occupancy comparison — the volumetric-truth metric.
+#
+# Surface distance measures how close the SKINS are; it cannot see whether the
+# same 3D space is SOLID. A filled-in internal chamber, a dropped pocket, an
+# oversize boss — all are occupancy errors that surface metrics under-report.
+# Slicing both solids at many stations along all three axes and comparing the
+# filled 2D regions (intersection / union) measures occupancy directly, needs no
+# watertight mesh (a slice only requires local closure), and localises every
+# divergence to "this slice, this 2D region" — which is exactly what the building
+# agent needs in order to fix it.
+# ----------------------------------------------------------------------------
+
+def _slice_region(mesh, axis, coord):
+    """Filled 2D region (shapely geometry) of the cross-section at `coord` along
+    `axis`, holes subtracted. None if the plane misses the mesh."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    from .draw import _section_polys
+    polys = _section_polys(mesh, axis, coord)
+    if not polys:
+        return None
+    geoms = []
+    for ext, ints in polys:
+        if len(ext) < 3:
+            continue
+        try:
+            g = Polygon(ext, [i for i in ints if len(i) >= 3]).buffer(0)
+            if not g.is_empty:
+                geoms.append(g)
+        except Exception:  # noqa: BLE001 — one bad loop must not kill the slice
+            continue
+    if not geoms:
+        return None
+    try:
+        u = unary_union(geoms)
+        return None if u.is_empty else u
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _void_area(region) -> float:
+    """Total interior-hole area of a shapely (Multi)Polygon region."""
+    from shapely.geometry import Polygon
+    if region is None:
+        return 0.0
+    total = 0.0
+    for g in getattr(region, "geoms", [region]):
+        for interior in getattr(g, "interiors", []):
+            try:
+                total += abs(Polygon(interior).area)
+            except Exception:  # noqa: BLE001
+                pass
+    return total
+
+
+def _holes_region(region):
+    """The interior-hole rings of a region as a filled geometry (the part's
+    enclosed void space in this slice), or None."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    if region is None:
+        return None
+    holes = []
+    for g in getattr(region, "geoms", [region]):
+        for interior in getattr(g, "interiors", []):
+            try:
+                h = Polygon(interior).buffer(0)
+                if not h.is_empty:
+                    holes.append(h)
+            except Exception:  # noqa: BLE001
+                pass
+    if not holes:
+        return None
+    try:
+        u = unary_union(holes)
+        return None if u.is_empty else u
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40) -> dict:
+    """Compare solid-vs-void occupancy of the part and the candidate by slicing
+    both along each axis and intersecting the filled regions.
+
+    Per slice: IoU (overlap quality), missing area (part solid, candidate void),
+    extra area (candidate solid, part void), and the 2D bounds of the largest
+    divergent region (so the agent knows WHERE). Per axis: an independent
+    estimate of missing/extra volume; the headline missing/extra fraction is the
+    worst (most sensitive) axis, relative to the part's solid volume. Also
+    tracks interior-hole (internal void) area the candidate fills solid — the
+    hollow-part-modelled-solid failure."""
+    names = "xyz"
+    lo3 = np.minimum(target_mesh.bounds[0], cand_mesh.bounds[0])
+    hi3 = np.maximum(target_mesh.bounds[1], cand_mesh.bounds[1])
+    per_axis = []
+    worst = []
+    for axis in axes:
+        lo, hi = float(lo3[axis]), float(hi3[axis])
+        length = hi - lo
+        if length <= 1e-6:
+            continue
+        ds = length / n
+        series = {"axis": names[axis], "coords": [], "iou": [],
+                  "missing_mm2": [], "extra_mm2": []}
+        miss_v = extra_v = filled_v = void_miss_v = 0.0
+        for k in range(n):
+            c = lo + (k + 0.5) * ds
+            mr = _slice_region(target_mesh, axis, c)
+            cr = _slice_region(cand_mesh, axis, c)
+            ma = float(mr.area) if mr is not None else 0.0
+            ca = float(cr.area) if cr is not None else 0.0
+            if mr is None and cr is None:
+                continue
+            if mr is not None and cr is not None:
+                inter = mr.intersection(cr)
+                ia = float(inter.area)
+                miss_a, extra_a = ma - ia, ca - ia
+                union_a = ma + ca - ia
+                iou = ia / union_a if union_a > 1e-9 else 1.0
+            else:
+                miss_a, extra_a = ma, ca
+                iou = 0.0
+            miss_v += miss_a; extra_v += extra_a; filled_v += ma
+            # cavity-fill: candidate material INSIDE the part's enclosed voids
+            # (an intersection, not a hole-area diff — a hole that is merely
+            # open-vs-enclosed between the two is not "filled solid").
+            holes = _holes_region(mr)
+            if holes is not None and cr is not None:
+                try:
+                    void_miss_v += float(cr.intersection(holes).area)
+                except Exception:  # noqa: BLE001
+                    pass
+            series["coords"].append(round(c, 2))
+            series["iou"].append(round(iou, 4))
+            series["missing_mm2"].append(round(miss_a, 1))
+            series["extra_mm2"].append(round(extra_a, 1))
+            if miss_a + extra_a > 1e-6:
+                where = None
+                try:
+                    diff = (mr.difference(cr) if miss_a >= extra_a and mr is not None
+                            and cr is not None else
+                            cr.difference(mr) if mr is not None and cr is not None
+                            else (mr or cr))
+                    if diff is not None and not diff.is_empty:
+                        b = diff.bounds
+                        where = [round(v, 1) for v in b]
+                except Exception:  # noqa: BLE001
+                    pass
+                worst.append({"axis": names[axis], "at_mm": round(c, 2),
+                              "iou": round(iou, 3),
+                              "missing_mm2": round(miss_a, 1),
+                              "extra_mm2": round(extra_a, 1),
+                              "region_uv_bounds": where})
+        series["missing_mm3"] = round(miss_v * ds, 1)
+        series["extra_mm3"] = round(extra_v * ds, 1)
+        series["filled_mm3"] = round(filled_v * ds, 1)
+        series["void_missing_mm3"] = round(void_miss_v * ds, 1)
+        series["mean_iou"] = (round(float(np.mean(series["iou"])), 4)
+                              if series["iou"] else None)
+        per_axis.append(series)
+    if not per_axis:
+        return {"per_axis": [], "worst_slices": [], "missing_frac": 0.0,
+                "extra_frac": 0.0, "void_missing_frac": 0.0, "mean_iou": None}
+    filled = float(np.mean([a["filled_mm3"] for a in per_axis])) or 1e-9
+    missing = max(a["missing_mm3"] for a in per_axis)
+    extra = max(a["extra_mm3"] for a in per_axis)
+    void_missing = max(a["void_missing_mm3"] for a in per_axis)
+    worst.sort(key=lambda w: -(w["missing_mm2"] + w["extra_mm2"]))
+    return {
+        "per_axis": per_axis,
+        "worst_slices": worst[:8],
+        "part_volume_mm3": round(filled, 1),
+        "missing_mm3": round(missing, 1), "extra_mm3": round(extra, 1),
+        "missing_frac": missing / filled, "extra_frac": extra / filled,
+        "void_missing_mm3": round(void_missing, 1),
+        "void_missing_frac": void_missing / filled,
+        "mean_iou": round(float(np.mean(
+            [a["mean_iou"] for a in per_axis if a["mean_iou"] is not None])), 4),
+    }
+
+
+def _draw_region(ax, geom, color, alpha=1.0, z=1):
+    """Fill a shapely (Multi)Polygon on a matplotlib axes, holes respected."""
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
+    if geom is None or geom.is_empty:
+        return
+    for g in getattr(geom, "geoms", [geom]):
+        if g.is_empty or not hasattr(g, "exterior"):
+            continue
+        verts = list(g.exterior.coords)
+        codes = ([Path.MOVETO] + [Path.LINETO] * (len(verts) - 2)
+                 + [Path.CLOSEPOLY])
+        for interior in g.interiors:
+            iv = list(interior.coords)
+            verts += iv
+            codes += [Path.MOVETO] + [Path.LINETO] * (len(iv) - 2) + [Path.CLOSEPOLY]
+        ax.add_patch(PathPatch(Path(verts, codes), facecolor=color,
+                               edgecolor="none", alpha=alpha, zorder=z))
+
+
+def render_slice_report(target_mesh, cand_mesh, occ: dict, path: str) -> str | None:
+    """One PNG the agent Reads: per axis, an IoU-vs-station chart plus overlays
+    of the two worst slices on that axis (agreement grey, MISSING material red,
+    EXTRA material blue). Localises every occupancy divergence visually."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    axes_data = occ.get("per_axis") or []
+    if not axes_data:
+        return None
+    ai = {"x": 0, "y": 1, "z": 2}
+    rows = len(axes_data)
+    fig, grid = plt.subplots(rows, 3, figsize=(13, 3.4 * rows))
+    if rows == 1:
+        grid = grid[None, :]
+    for r, s in enumerate(axes_data):
+        axis = ai[s["axis"]]
+        chart = grid[r, 0]
+        if s["coords"]:
+            chart.plot(s["coords"], s["iou"], "-", color="0.3", lw=1)
+            bad = [(c, i) for c, i in zip(s["coords"], s["iou"]) if i < 0.98]
+            if bad:
+                chart.plot(*zip(*bad), "r.", ms=4)
+        chart.set_ylim(0, 1.05)
+        chart.set_ylabel(f"{s['axis']}-slices IoU", fontsize=9)
+        chart.set_title(f"axis {s['axis']}: mean IoU {s['mean_iou']}  "
+                        f"missing {s['missing_mm3']}mm³ extra {s['extra_mm3']}mm³",
+                        fontsize=9)
+        chart.tick_params(labelsize=7)
+        # two worst slices on this axis (from the axis's own series, so every
+        # row gets its overlays even when the global worst list is one-axis)
+        ranked = sorted(zip(s["coords"], s["iou"], s["missing_mm2"],
+                            s["extra_mm2"]),
+                        key=lambda t: -(t[2] + t[3]))
+        cand_slices = [{"at_mm": c, "iou": i, "missing_mm2": m, "extra_mm2": e}
+                       for c, i, m, e in ranked if m + e > 1e-6][:2]
+        for c_i in range(2):
+            ax2 = grid[r, 1 + c_i]
+            ax2.set_xticks([]); ax2.set_yticks([])
+            if c_i >= len(cand_slices):
+                ax2.set_axis_off()
+                continue
+            w = cand_slices[c_i]
+            mr = _slice_region(target_mesh, axis, w["at_mm"])
+            cr = _slice_region(cand_mesh, axis, w["at_mm"])
+            try:
+                if mr is not None and cr is not None:
+                    _draw_region(ax2, mr.intersection(cr), "0.75")
+                    _draw_region(ax2, mr.difference(cr), (0.85, 0.12, 0.12), z=2)
+                    _draw_region(ax2, cr.difference(mr), (0.12, 0.35, 0.88), z=2)
+                else:
+                    _draw_region(ax2, mr, (0.85, 0.12, 0.12), z=2)
+                    _draw_region(ax2, cr, (0.12, 0.35, 0.88), z=2)
+            except Exception:  # noqa: BLE001
+                pass
+            bounds = [g.bounds for g in (mr, cr) if g is not None
+                      and not g.is_empty]
+            if bounds:
+                bx = np.array(bounds)
+                pad = 0.05 * max(bx[:, 2].max() - bx[:, 0].min(),
+                                 bx[:, 3].max() - bx[:, 1].min(), 1.0)
+                ax2.set_xlim(bx[:, 0].min() - pad, bx[:, 2].max() + pad)
+                ax2.set_ylim(bx[:, 1].min() - pad, bx[:, 3].max() + pad)
+            ax2.set_aspect("equal", adjustable="box")
+            ax2.set_title(f"{s['axis']}={w['at_mm']}  IoU {w['iou']}  "
+                          f"red=missing blue=extra", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def internal_void_summary(mesh, *, n=64) -> dict | None:
     """Quantify the part's OWN internal cavity so the brief can flag it up front:
     total interior-void volume, its fraction of the solid volume, and the axial
