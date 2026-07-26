@@ -107,6 +107,10 @@ PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --a
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe profile <PART.stl> --axis x --n 40
 # inside/outside solid at points — through vs blind, void checks
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe point <PART.stl> 0,6,22 0,50,22
+# INTERNAL STRUCTURE: dimension the cavities — dense void scan along an axis,
+# tracked + split into ~constant segments (span/Ø/volume/open-vs-SEALED), with
+# ready-to-paste cuts (--snippets) and an internal-silhouette atlas (--atlas).
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe voids <PART.stl> --axis x --snippets --atlas <WORKDIR>/voids_x.png
 # ZOOM: render section DRAWINGS at chosen coords or densely across a band —
 # grey=material, white=INTERNAL VOID. Use on any band the 4 default sections
 # step over (a head, a cavity zone, wherever INTERNAL CAVITY was flagged).
@@ -192,17 +196,21 @@ Write a build123d script to `<WORKDIR>/attempt.py`:
   mode=Mode.SUBTRACT` extrudes on the right face/plane, bosses as adds, fillets
   and chamfers with `fillet`/`chamfer` on the relevant edges.
 - **INTERNAL CAVITIES — the biggest trap.** `extrude`/`revolve` build the OUTER
-  form; they do NOT create internal structure. If the brief prints
-  `INTERNAL CAVITY` (or the part is a housing/nozzle/manifold), the part is HOLLOW
-  inside and you must CUT that cavity, or you ship a solid blob that only looks
-  right from outside. A revolve of the outer silhouette discards EVERY internal
-  feature — an off-axis chamber, a swirl/volute, a counterbored seat, internal
-  thread relief. To model it: take **transverse sections** through the cavity band
-  (`probe sections --axis <a> --at=<coords>` — interior loops are the cavity
-  walls), read the cavity's real cross-section from `part_sections.png`, and
-  subtract it (`Mode.SUBTRACT`). An off-axis cavity is NOT a revolve — build it as
-  a positioned cut. The verify step measures internal void and will FAIL a solid
-  model of a hollow part, so model the inside, not just the outline.
+  form; they do NOT create internal structure. A revolve of the outer silhouette
+  discards EVERY internal feature — an off-axis chamber, a swirl/volute, a
+  counterbored seat. When the brief prints `INTERNAL CAVITY`, it also prints the
+  **dimensioned cavity table** (each cavity's shape, Ø/bbox, axial span, volume,
+  centre, and open-vs-SEALED) and writes `void_atlas.png` — Read it: the top
+  chart is the internal silhouette (each cavity's radius vs station — the drill
+  profile), the slices below show the void in orange at every change point.
+  **Model every cavity in the table as a CUT**, working from its numbers, not
+  from a guess: `probe voids <PART.stl> --axis <a> --snippets` prints
+  ready-to-paste `Mode.SUBTRACT` cuts for constant circular/annular cavities;
+  run it on EACH axis (an inlet crosses the main axis; a cavity appearing as
+  "profiled" on one axis is often circular on another). A SEALED cavity cannot
+  be cut from an end face — cut it before capping, or cut deeper and re-cap.
+  The occupancy gate measures internal void and will FAIL a solid model of a
+  hollow part: the inside is as much the part as the outside.
 - **Fillets & chamfers**: the brief's `edge_treatments` flags approximate fillet
   radii/counts (the segmenter hides them in freeform, so they're a hint — often
   ~10% high). Fillets show as ARCS in the cross-sections, chamfers as short

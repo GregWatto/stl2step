@@ -866,8 +866,40 @@ def _cli_brief(args) -> int:
         print(f"  INTERNAL CAVITY: {voidsum['void_mm3']} mm^3 of internal void "
               f"({100*voidsum['void_frac']:.1f}% of solid), concentrated along "
               f"{voidsum['axis']} in {voidsum['cavity_band_mm']} mm. The part is "
-              f"HOLLOW inside here — model the cavity (section it in the transverse "
-              f"slices and cut it); a solid body will fail the internal-void check.")
+              f"HOLLOW inside here — model each cavity below as a CUT; a solid "
+              f"body will fail the internal-void check.")
+        # dimension the cavities on all three axes — the internal structure the
+        # composer must rebuild, as named/numbered features, not just pictures
+        try:
+            from . import voids as vd
+            best_axis, best_vol, tables = 0, -1.0, []
+            for ax in (0, 1, 2):
+                res = vd.analyze_voids(ing.mesh, ax, n=48)
+                vol = sum(f["volume_mm3"] for f in res["features"])
+                tables.append(res)
+                if vol > best_vol:
+                    best_axis, best_vol = ax, vol
+            print("  internal cavity features (probe voids for snippets/detail):")
+            shown = 0
+            for res in tables:
+                for f in res["features"]:
+                    if shown >= 10:
+                        break
+                    d = f.get("diameter_mm") or f.get("outer_diameter_mm")
+                    dd = f"Ø{d}" if d else f"bbox {f.get('bbox_uv_mm')}"
+                    print(f"    {f['shape']:9} {dd:>13}  {f['axis']} "
+                          f"{f['span_mm'][0]}..{f['span_mm'][1]}  vol "
+                          f"{f['volume_mm3']}mm^3  centre {f['center_uv_mm']} "
+                          f"{f['uv_axes']}  {f['ends']}")
+                    shown += 1
+            atlas = vd.render_void_atlas(
+                ing.mesh, best_axis, tables[best_axis],
+                os.path.join(args.workdir, "void_atlas.png"))
+            if atlas:
+                print(f"  void atlas : {atlas}   <- Read this image (internal "
+                      f"silhouette + change-point slices)")
+        except Exception:  # noqa: BLE001 — cavity table is best-effort
+            pass
     feats = a.get("features") or {}
     if feats.get("holes") or feats.get("bosses") or feats.get("pockets"):
         print("  features (grouped):")

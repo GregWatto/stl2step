@@ -385,6 +385,48 @@ def cmd_slicepics(m: trimesh.Trimesh, args) -> dict:
     return result
 
 
+def cmd_voids(m: trimesh.Trimesh, args) -> dict:
+    """Dimension the internal cavities along an axis: dense void scan, tracked
+    + step-split into ~constant segments, each with span/Ø/volume/openness and
+    a cut snippet when it's directly buildable. The answer to 'the outside looks
+    right but the inside is wrong'."""
+    from . import voids as vd
+    ai = _axis(args.axis)
+    t_range = None
+    if args.range:
+        r = [float(x) for x in args.range.split(",")]
+        if len(r) != 2:
+            raise SystemExit("--range needs lo,hi (use = form for negatives)")
+        t_range = (r[0], r[1])
+    res = vd.analyze_voids(m, ai, t_range=t_range, n=args.n)
+    if not args.json:
+        feats = res["features"]
+        print(f"{len(feats)} internal cavity feature(s) along {args.axis} "
+              f"(band {res['band_mm']}, {res['n_stations']} stations):")
+        for f in feats:
+            d = f.get("diameter_mm") or f.get("outer_diameter_mm")
+            dd = (f"Ø{d}" if d else f"bbox {f.get('bbox_uv_mm')}")
+            drift = (f"  drift {f['centroid_drift_mm']}mm"
+                     if f.get("centroid_drift_mm") else "")
+            print(f"  {f['shape']:9} {dd:>14}  {f['axis']} "
+                  f"{f['span_mm'][0]}..{f['span_mm'][1]} (L{f['length_mm']})  "
+                  f"vol {f['volume_mm3']}mm^3  centre {f['center_uv_mm']} "
+                  f"{f['uv_axes']}  {f['ends']}{drift}")
+            if args.snippets:
+                s = vd.cut_snippet(f)
+                if s:
+                    print(s)
+        if args.atlas:
+            p = vd.render_void_atlas(m, ai, res, args.atlas)
+            if p:
+                print(f"atlas: {p}   <- Read this image (internal silhouette + "
+                      f"change-point slices, orange = void)")
+        print("model each cavity as a CUT (Mode.SUBTRACT); a SEALED cavity "
+              "needs the enclosing geometry built around it. Re-run per axis "
+              "for cross-features (an inlet along another axis).")
+    return res
+
+
 def cmd_thread(m: trimesh.Trimesh, args) -> dict:
     """Identify a thread on a cylindrical wall band: measured minor/major
     diameter, pitch (helix period), taper (pipe threads), and the closest
@@ -496,6 +538,19 @@ def main(argv=None) -> int:
     sp.add_argument("--n", type=int, default=8, help="slices across --range")
     sp.add_argument("--out", default=None, help="output PNG path")
     sp.set_defaults(fn=cmd_slicepics)
+
+    vd = sub.add_parser("voids", help="dimension the INTERNAL cavities: dense "
+                                      "void scan + tracked features + atlas")
+    vd.add_argument("stl"); vd.add_argument("--axis", required=True)
+    vd.add_argument("--range", default=None,
+                    help="axial band lo,hi (= form for negatives); default full")
+    vd.add_argument("--n", type=int, default=72, help="stations")
+    vd.add_argument("--atlas", default=None,
+                    help="write the internal-structure atlas PNG here")
+    vd.add_argument("--snippets", action="store_true",
+                    help="print ready-to-paste build123d cuts for constant "
+                         "circular/annular cavities")
+    vd.set_defaults(fn=cmd_voids)
 
     tr = sub.add_parser("thread", help="identify a thread (pitch, Ø, standard "
                                        "spec) on a hole/stud wall band")
