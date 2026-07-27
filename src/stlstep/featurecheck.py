@@ -161,6 +161,136 @@ def _holes_region(region):
         return None
 
 
+def _interior_rings(region, min_area=1.5):
+    """Interior rings (openings/holes in the material) of a slice region as
+    filled polygons."""
+    from shapely.geometry import Polygon
+    rings = []
+    if region is None:
+        return rings
+    for g in getattr(region, "geoms", [region]):
+        for interior in getattr(g, "interiors", []):
+            try:
+                p = Polygon(interior).buffer(0)
+                if not p.is_empty and p.area >= min_area:
+                    rings.append(p)
+            except Exception:  # noqa: BLE001
+                pass
+    return rings
+
+
+def _ring_shape(poly) -> str:
+    """Human label for a ring: 'CIRCLE Ød' / 'rect w x h' / 'profiled'."""
+    from .draw import _circle_fit_2d
+    try:
+        pts = np.asarray(poly.exterior.coords)[:, :2]
+    except Exception:  # noqa: BLE001
+        return "profiled"
+    if len(pts) < 6:
+        return "profiled"
+    w, h = pts.max(axis=0) - pts.min(axis=0)
+    area = float(poly.area)
+    cf = _circle_fit_2d(pts)
+    if (cf is not None and cf[3] < 0.05 * cf[2]
+            and max(w, h) / max(min(w, h), 1e-6) < 1.2
+            and abs(2 * cf[2] - max(w, h)) < 0.3 * max(w, h)
+            and abs(area - np.pi * cf[2] ** 2) < 0.2 * np.pi * cf[2] ** 2):
+        return f"CIRCLE Ø{2 * cf[2]:.2f}"
+    if area > 0.92 * w * h:
+        return f"rect {w:.2f} x {h:.2f}"
+    return "profiled"
+
+
+def _match_rings(mr, cr, axis_name, coord, out):
+    """Per-station scale-free opening check: every interior ring (hole/opening)
+    of the MESH must have a candidate ring of the same SHAPE (IoU >= 0.85 —
+    a square over a circle scores ~0.785), regardless of size. Deviation
+    quantiles and area floors are extensive, so a squared Ø4 hole sails under
+    them; a per-loop IoU cannot be diluted by part size. Appends mismatch
+    records to `out`."""
+    m_rings = _interior_rings(mr)
+    c_rings = _interior_rings(cr)
+    if not m_rings and not c_rings:
+        return
+    used = set()
+    for rm in m_rings:
+        cm = rm.centroid
+        best, best_iou = None, 0.0
+        for k, rc in enumerate(c_rings):
+            if k in used:
+                continue
+            if cm.distance(rc.centroid) > max(2.0, 1.5 * float(np.sqrt(rm.area))):
+                continue
+            try:
+                inter = rm.intersection(rc).area
+            except Exception:  # noqa: BLE001
+                continue
+            union = rm.area + rc.area - inter
+            iou = inter / union if union > 1e-9 else 0.0
+            if iou > best_iou:
+                best, best_iou = k, iou
+        rec = {"axis": axis_name, "at_mm": round(coord, 2),
+               "center_uv": [round(float(cm.x), 2), round(float(cm.y), 2)],
+               "mesh_shape": _ring_shape(rm),
+               "area_mm2": round(float(rm.area), 1)}
+        if best is not None:
+            used.add(best)
+            if best_iou < 0.85:
+                rec.update({"kind": "shape mismatch",
+                            "iou": round(best_iou, 3),
+                            "cand_shape": _ring_shape(c_rings[best])})
+                out.append(rec)
+        else:
+            # no candidate ring at all — flag only when the candidate is SOLID
+            # there (a true missing opening, not an occupancy hole already seen)
+            try:
+                covered = cr is not None and cr.contains(cm)
+            except Exception:  # noqa: BLE001
+                covered = False
+            if covered:
+                rec.update({"kind": "missing opening", "iou": 0.0})
+                out.append(rec)
+    for k, rc in enumerate(c_rings):
+        if k in used:
+            continue
+        try:
+            inside_mesh = mr is not None and mr.contains(rc.centroid)
+        except Exception:  # noqa: BLE001
+            inside_mesh = False
+        if inside_mesh:
+            out.append({"axis": axis_name, "at_mm": round(coord, 2),
+                        "center_uv": [round(float(rc.centroid.x), 2),
+                                      round(float(rc.centroid.y), 2)],
+                        "kind": "extra opening",
+                        "cand_shape": _ring_shape(rc),
+                        "area_mm2": round(float(rc.area), 1), "iou": 0.0})
+
+
+def _group_mismatches(raw: list[dict]) -> list[dict]:
+    """Cluster per-station mismatch records by location: one report per opening,
+    with the stations it was seen at and the worst IoU."""
+    groups: list[dict] = []
+    for r in raw:
+        placed = False
+        for g in groups:
+            if (g["kind"] == r["kind"] and g["axis"] == r["axis"]
+                    and abs(g["center_uv"][0] - r["center_uv"][0]) < 1.5
+                    and abs(g["center_uv"][1] - r["center_uv"][1]) < 1.5):
+                g["stations"].append(r["at_mm"])
+                if r["iou"] < g["iou"]:
+                    g["iou"] = r["iou"]
+                    if "cand_shape" in r:
+                        g["cand_shape"] = r["cand_shape"]
+                placed = True
+                break
+        if not placed:
+            g = dict(r)
+            g["stations"] = [g.pop("at_mm")]
+            groups.append(g)
+    groups.sort(key=lambda g: (g["kind"] != "missing opening", g["iou"]))
+    return groups
+
+
 def _band_slice_region(band, axis, coord):
     """The thread band's footprint on the slice plane {axis == coord} as a
     shapely region, or None if it doesn't intersect. Aligned slice (plane ⟂ the
@@ -222,6 +352,7 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
     hi3 = np.maximum(target_mesh.bounds[1], cand_mesh.bounds[1])
     per_axis = []
     worst = []
+    ring_raw: list[dict] = []
     for axis in axes:
         lo, hi = float(lo3[axis]), float(hi3[axis])
         length = hi - lo
@@ -253,6 +384,12 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
                         pass
                 ma = float(mr.area) if mr is not None else 0.0
                 ca = float(cr.area) if cr is not None else 0.0
+            # per-loop opening check (scale-free) — after band masking, so
+            # recognized thread bands don't produce ring mismatches
+            try:
+                _match_rings(mr, cr, names[axis], float(c), ring_raw)
+            except Exception:  # noqa: BLE001
+                pass
             if mr is not None and cr is not None:
                 inter = mr.intersection(cr)
                 ia = float(inter.area)
@@ -301,8 +438,9 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
                               if series["iou"] else None)
         per_axis.append(series)
     if not per_axis:
-        return {"per_axis": [], "worst_slices": [], "missing_frac": 0.0,
-                "extra_frac": 0.0, "void_missing_frac": 0.0, "mean_iou": None}
+        return {"per_axis": [], "worst_slices": [], "loop_mismatches": [],
+                "missing_frac": 0.0, "extra_frac": 0.0,
+                "void_missing_frac": 0.0, "mean_iou": None}
     filled = float(np.mean([a["filled_mm3"] for a in per_axis])) or 1e-9
     missing = max(a["missing_mm3"] for a in per_axis)
     extra = max(a["extra_mm3"] for a in per_axis)
@@ -310,6 +448,7 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
     worst.sort(key=lambda w: -(w["missing_mm2"] + w["extra_mm2"]))
     return {
         "per_axis": per_axis,
+        "loop_mismatches": _group_mismatches(ring_raw)[:10],
         "worst_slices": worst[:8],
         "part_volume_mm3": round(filled, 1),
         "missing_mm3": round(missing, 1), "extra_mm3": round(extra, 1),

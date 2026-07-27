@@ -1049,6 +1049,16 @@ def _cli_run(args) -> int:
                           f"({100*occ['void_missing_frac']:.1f}%) — the part is "
                           f"HOLLOW where your model is SOLID. Section the cavity "
                           f"band and cut it (Mode.SUBTRACT).")
+                if occ.get("loop_mismatches"):
+                    print("  OPENING MISMATCHES (scale-free per-loop check — "
+                          "every hole/opening must match SHAPE, however small):")
+                    for g in occ["loop_mismatches"]:
+                        got = (f" modelled as {g['cand_shape']}"
+                               if g.get("cand_shape") else "")
+                        print(f"    {g['kind']}: {g.get('mesh_shape', '?')} at "
+                              f"{g['axis']}~{g['stations'][0]} centre "
+                              f"{g['center_uv']}{got}  (IoU {g['iou']}, "
+                              f"{len(g['stations'])} station(s))")
                 if occ["worst_slices"]:
                     print("  worst slices (fix these first — probe the section "
                           "at each coordinate):")
@@ -1064,7 +1074,8 @@ def _cli_run(args) -> int:
                 if spng:
                     print(f"slice report: {spng}   <- Read this image (grey=match, "
                           f"red=missing, blue=extra, per worst slice)")
-                occ_gap = (occ["missing_frac"] > 0.03 or occ["extra_frac"] > 0.03)
+                occ_gap = (occ["missing_frac"] > 0.03 or occ["extra_frac"] > 0.03
+                           or bool(occ.get("loop_mismatches")))
         except Exception:  # noqa: BLE001
             pass
 
@@ -1101,10 +1112,14 @@ def _cli_run(args) -> int:
         if hard_gap:
             why.append("missing editable features (above)")
         if occ_gap:
-            why.append(f"occupancy mismatch (missing "
-                       f"{100*occ['missing_frac']:.1f}% / extra "
-                       f"{100*occ['extra_frac']:.1f}% of the part's volume — "
-                       f"see the worst slices + slice report)")
+            parts_ = []
+            if occ["missing_frac"] > 0.03 or occ["extra_frac"] > 0.03:
+                parts_.append(f"missing {100*occ['missing_frac']:.1f}% / extra "
+                              f"{100*occ['extra_frac']:.1f}% of volume")
+            if occ.get("loop_mismatches"):
+                parts_.append(f"{len(occ['loop_mismatches'])} opening shape "
+                              f"mismatch(es) — see OPENING MISMATCHES above")
+            why.append("occupancy: " + "; ".join(parts_))
         print(f"STATUS: FAIL  ({'; '.join(why)})" if why else "STATUS: FAIL")
     else:
         print(f"STATUS: {'PASS' if passed else 'FAIL'}")

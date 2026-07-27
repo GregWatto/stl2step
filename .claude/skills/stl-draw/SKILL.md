@@ -252,7 +252,14 @@ coordinates and 2D region bounds** — then writes `<tag>_slices.png` (grey=matc
 red=missing material, blue=extra). **Read that image**; fix the worst slices
 first, using `probe sections --axis <a> --at=<coord>` at exactly those
 coordinates to read the true geometry there. PASS requires missing AND extra
-under 3% of the part's volume.
+under 3% of the part's volume, AND zero `OPENING MISMATCHES`: a **scale-free
+per-loop check** matches every hole/opening in the mesh sections against your
+model's — by SHAPE (IoU ≥ 0.85), however small. A Ø4 circle modelled as a 4×4
+square is invisible to deviation quantiles and area floors, but scores loop-IoU
+0.755 and fails here, with the exact location and both shapes named
+(`CIRCLE Ø3.95 ... modelled as rect 4.00 x 4.00`). `missing opening` = your model
+is solid where the part has a hole; `extra opening` = you cut one the part
+doesn't have. Fix each named opening at its printed centre.
 
 **Zoom on demand.** The uniform pass samples ~40 stations per axis and can step
 over a small feature; when it flags a band (or you suspect one), request a dense
