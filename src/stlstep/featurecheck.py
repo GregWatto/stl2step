@@ -180,7 +180,12 @@ def _interior_rings(region, min_area=1.5):
 
 
 def _ring_shape(poly) -> str:
-    """Human label for a ring: 'CIRCLE Ød' / 'rect w x h' / 'profiled'."""
+    """Human label for a ring: 'CIRCLE Ød' / 'rect w x h' / 'profiled (~N
+    sides)'. The rect test is BOUNDARY-based (Hausdorff to the bbox rectangle),
+    not area-based: an HDMI-style trapezoid fills ~95% of its bbox and an
+    area threshold labels it "rect" — which shipped an HDMI port as a plain
+    box. Area summaries lie about near-rect shapes; boundaries don't."""
+    from shapely.geometry import box
     from .draw import _circle_fit_2d
     try:
         pts = np.asarray(poly.exterior.coords)[:, :2]
@@ -188,7 +193,8 @@ def _ring_shape(poly) -> str:
         return "profiled"
     if len(pts) < 6:
         return "profiled"
-    w, h = pts.max(axis=0) - pts.min(axis=0)
+    lo = pts.min(axis=0); hi = pts.max(axis=0)
+    w, h = hi - lo
     area = float(poly.area)
     cf = _circle_fit_2d(pts)
     if (cf is not None and cf[3] < 0.05 * cf[2]
@@ -196,9 +202,23 @@ def _ring_shape(poly) -> str:
             and abs(2 * cf[2] - max(w, h)) < 0.3 * max(w, h)
             and abs(area - np.pi * cf[2] ** 2) < 0.2 * np.pi * cf[2] ** 2):
         return f"CIRCLE Ø{2 * cf[2]:.2f}"
-    if area > 0.92 * w * h:
+    try:
+        hd = poly.exterior.hausdorff_distance(
+            box(lo[0], lo[1], hi[0], hi[1]).exterior)
+    except Exception:  # noqa: BLE001
+        hd = float("inf")
+    if hd < max(0.25, 0.01 * max(w, h)):
         return f"rect {w:.2f} x {h:.2f}"
-    return "profiled"
+    # segment count hint so 'profiled' is actionable
+    try:
+        from .draw import fit_loop
+        segs = fit_loop(pts, arcs=True)
+        n = len(segs) if segs else 0
+        kinds = set(s.kind for s in (segs or []))
+        hint = f"~{n} sides" + (" w/ arcs" if "arc" in kinds else "")
+        return f"profiled ({hint})"
+    except Exception:  # noqa: BLE001
+        return "profiled"
 
 
 def _match_rings(mr, cr, axis_name, coord, out):
@@ -240,6 +260,22 @@ def _match_rings(mr, cr, axis_name, coord, out):
                             "iou": round(best_iou, 3),
                             "cand_shape": _ring_shape(c_rings[best])})
                 out.append(rec)
+            else:
+                # detail check: IoU is an AREA summary and blesses near-rect
+                # shapes (HDMI trapezoid vs box scores ~0.95); the boundary
+                # Hausdorff distance sees the corner cuts it hides.
+                try:
+                    hd = rm.exterior.hausdorff_distance(
+                        c_rings[best].exterior)
+                except Exception:  # noqa: BLE001
+                    hd = 0.0
+                b = rm.bounds
+                if hd > max(0.35, 0.02 * max(b[2] - b[0], b[3] - b[1])):
+                    rec.update({"kind": "profile detail mismatch",
+                                "iou": round(best_iou, 3),
+                                "boundary_dev_mm": round(float(hd), 2),
+                                "cand_shape": _ring_shape(c_rings[best])})
+                    out.append(rec)
         else:
             # no candidate ring at all — flag only when the candidate is SOLID
             # there (a true missing opening, not an occupancy hole already seen)

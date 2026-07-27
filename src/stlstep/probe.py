@@ -132,30 +132,18 @@ def cmd_sections(m: trimesh.Trimesh, args) -> dict:
 
 
 def _loop_shape(pts) -> str:
-    """Classify a section loop so extents are never read shape-blind: a CIRCLE's
-    bbox is identical to a square's — transcribing bboxes turned round holes into
-    squares once. Returns 'CIRCLE Ød', 'rect w x h', or 'profiled'."""
+    """Classify a section loop so extents are never read shape-blind (a circle's
+    bbox equals a square's; an HDMI trapezoid's area ≈ its bbox's). Shared with
+    the verify-side ring classifier so probe and gate can never disagree."""
     from shapely.geometry import Polygon
-    from .draw import _circle_fit_2d
-    pts = np.asarray(pts, dtype=float)
-    if len(pts) < 6:
-        return "profiled"
-    w, h = pts.max(axis=0) - pts.min(axis=0)
+    from .featurecheck import _ring_shape
     try:
-        area = abs(Polygon(pts).area)
+        p = Polygon(np.asarray(pts, dtype=float)).buffer(0)
+        if p.is_empty:
+            return "profiled"
+        return _ring_shape(p)
     except Exception:  # noqa: BLE001
         return "profiled"
-    if area < 1e-6:
-        return "profiled"
-    cf = _circle_fit_2d(pts)
-    if (cf is not None and cf[3] < 0.05 * cf[2]
-            and max(w, h) / max(min(w, h), 1e-6) < 1.2
-            and abs(2 * cf[2] - max(w, h)) < 0.3 * max(w, h)
-            and abs(area - np.pi * cf[2] ** 2) < 0.2 * np.pi * cf[2] ** 2):
-        return f"CIRCLE Ø{2 * cf[2]:.2f}"
-    if area > 0.92 * w * h:
-        return f"rect {w:.2f} x {h:.2f}"
-    return "profiled"
 
 
 def cmd_slice(m: trimesh.Trimesh, args) -> dict:
@@ -456,6 +444,81 @@ def cmd_voids(m: trimesh.Trimesh, args) -> dict:
     return res
 
 
+def cmd_cutouts(m: trimesh.Trimesh, args) -> dict:
+    """Extract every opening in a wall as its EXACT fitted profile and emit
+    ready-to-paste build123d cuts. Kills the lossy-transcription failure class:
+    an agent redrawing openings from bbox/label summaries turned round holes into
+    squares and an HDMI trapezoid into a box — here the measured loop (lines +
+    arcs, via the same fitter that rebuilds 52-facet profiles to 0.012mm) flows
+    straight into the model as code. The agent places; it never traces."""
+    from shapely.geometry import Point
+    from . import featurecheck as fc
+    from .draw import fit_loop, _emit_loop_lines, _fmt, _PLANE
+    ai = _axis(args.axis)
+    u, v = _perp(ai)
+    names = "xyz"
+    region = fc._slice_region(m, ai, args.at)
+    if region is None:
+        raise SystemExit(f"no material at {args.axis}={args.at}")
+    rings = fc._interior_rings(region, min_area=args.min_area)
+    if not rings:
+        print(f"no openings >= {args.min_area}mm^2 at {args.axis}={args.at}")
+        return {"openings": []}
+
+    out = {"axis": args.axis, "at_mm": args.at, "openings": []}
+    print(f"{len(rings)} opening(s) in the {args.axis}={args.at} wall "
+          f"(coords are ({names[u]},{names[v]})):")
+    L_all = []
+    for i, ring in enumerate(sorted(rings, key=lambda r: -r.area)):
+        pts = np.asarray(ring.exterior.coords)[:, :2]
+        shape = fc._ring_shape(ring)
+        cen = ring.centroid
+        # wall span along the axis: walk both ways while material still exists
+        # just beside the opening (1mm outside its bbox edge)
+        b0 = ring.bounds
+        beside = Point(b0[2] + 1.0, cen.y)
+        w0 = w1 = args.at
+        for sgn in (-1, 1):
+            t = args.at
+            while abs(t - args.at) < 8:
+                t2 = t + sgn * 0.25
+                r2 = fc._slice_region(m, ai, t2)
+                try:
+                    ok = r2 is not None and r2.contains(beside)
+                except Exception:  # noqa: BLE001
+                    ok = False
+                if not ok:
+                    break
+                t = t2
+            if sgn < 0:
+                w0 = t
+            else:
+                w1 = t
+        thk = round(w1 - w0 + 0.5, 2)
+        segs = fit_loop(pts, arcs=True)
+        b = ring.bounds
+        print(f"  #{i+1}: {shape}  centre ({cen.x:.2f},{cen.y:.2f})  bbox "
+              f"[{b[0]:.2f},{b[1]:.2f}]..[{b[2]:.2f},{b[3]:.2f}]  wall "
+              f"~{max(w1-w0,0.5):.1f}mm")
+        out["openings"].append({"shape": shape,
+                                "center": [round(cen.x, 2), round(cen.y, 2)],
+                                "bbox": [round(x, 2) for x in b]})
+        if segs:
+            L = [f"    # opening #{i+1}: {shape} at "
+                 f"({names[u]},{names[v]})=({cen.x:.2f},{cen.y:.2f}) — exact "
+                 f"measured profile",
+                 f"    with BuildSketch(Plane.{_PLANE[ai]}"
+                 f".offset({_fmt(w0 - 0.25)})):"]
+            L.extend(_emit_loop_lines(segs, "", 8))
+            L.append(f"    extrude(amount={_fmt(thk)}, mode=Mode.SUBTRACT)")
+            L_all.append("\n".join(L))
+    if L_all:
+        print("\n--- paste-ready cuts (exact profiles — do NOT re-draw from "
+              "the numbers above) ---")
+        print("\n".join(L_all))
+    return out
+
+
 def cmd_thread(m: trimesh.Trimesh, args) -> dict:
     """Identify a thread on a cylindrical wall band: measured minor/major
     diameter, pitch (helix period), taper (pipe threads), and the closest
@@ -567,6 +630,15 @@ def main(argv=None) -> int:
     sp.add_argument("--n", type=int, default=8, help="slices across --range")
     sp.add_argument("--out", default=None, help="output PNG path")
     sp.set_defaults(fn=cmd_slicepics)
+
+    co = sub.add_parser("cutouts", help="extract a wall's openings as EXACT "
+                                        "fitted profiles + paste-ready cuts")
+    co.add_argument("stl"); co.add_argument("--axis", required=True)
+    co.add_argument("--at", type=float, required=True,
+                    help="station inside the wall (use --at=-2 form for negatives)")
+    co.add_argument("--min-area", type=float, default=1.5,
+                    help="ignore openings smaller than this (mm^2)")
+    co.set_defaults(fn=cmd_cutouts)
 
     vd = sub.add_parser("voids", help="dimension the INTERNAL cavities: dense "
                                       "void scan + tracked features + atlas")

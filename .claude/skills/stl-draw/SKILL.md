@@ -99,11 +99,16 @@ numbers; add `--json` for machine-readable output.
 ```
 # overall bounds / volume / watertight
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe bbox <PART.stl>
-# loops at planes ⟂ an axis — extents + SHAPE per loop (<CIRCLE Ød> / <rect w x h>
-# / <profiled>). NEVER transcribe a loop's bbox without its shape tag: a circle's
-# bbox equals a square's, and bbox-transcription once shipped squared holes. A
-# <profiled> loop needs a closer look (slicepics) — often a rounded slot.
+# loops at planes ⟂ an axis — extents + SHAPE per loop (<CIRCLE Ød> /
+# <rect w x h> / <profiled (~N sides)>). The rect tag is boundary-verified, so
+# trust it — but a <profiled> loop is NEVER a box (an HDMI port, a stadium slot).
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe sections <PART.stl> --axis z --at 0.05,0.15,0.5 --frac
+# WALL OPENINGS — do NOT re-draw them by hand, EVER. Hand-transcription from
+# bboxes/labels is lossy and has shipped round holes as squares and an HDMI
+# port as a plain box. `cutouts` extracts every opening in a wall as its EXACT
+# fitted profile (lines + arcs) and emits paste-ready Mode.SUBTRACT cuts with
+# the measured wall depth — paste them; your job is placement, not tracing:
+PYTHONPATH=src ./.venv/bin/python -m stlstep.probe cutouts <PART.stl> --axis y --at=63 --min-area 2
 # material extent in one plane, optionally inside a window (= form for negatives)
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --at 14.5 --window=-76,-54,0,20
 # radius vs axial position — reads off a revolve's silhouette + bore
@@ -254,12 +259,13 @@ first, using `probe sections --axis <a> --at=<coord>` at exactly those
 coordinates to read the true geometry there. PASS requires missing AND extra
 under 3% of the part's volume, AND zero `OPENING MISMATCHES`: a **scale-free
 per-loop check** matches every hole/opening in the mesh sections against your
-model's — by SHAPE (IoU ≥ 0.85), however small. A Ø4 circle modelled as a 4×4
-square is invisible to deviation quantiles and area floors, but scores loop-IoU
-0.755 and fails here, with the exact location and both shapes named
-(`CIRCLE Ø3.95 ... modelled as rect 4.00 x 4.00`). `missing opening` = your model
-is solid where the part has a hole; `extra opening` = you cut one the part
-doesn't have. Fix each named opening at its printed centre.
+model's — by SHAPE, however small. Two levels: gross (IoU < 0.85 — a Ø4 circle
+modelled as a 4×4 square scores 0.755) and detail (boundary deviation > ~0.35mm
+at matching area — an HDMI trapezoid modelled as its bounding box scores IoU
+0.95 but boundary-deviates ~2mm at the corner cuts; `profile detail mismatch`).
+`missing opening` = your model is solid where the part has a hole; `extra
+opening` = you cut one the part doesn't have. Fix each named opening at its
+printed centre — with `probe cutouts`, never by re-drawing.
 
 **Zoom on demand.** The uniform pass samples ~40 stations per axis and can step
 over a small feature; when it flags a band (or you suspect one), request a dense
