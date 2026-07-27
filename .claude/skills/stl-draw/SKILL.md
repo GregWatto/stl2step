@@ -99,7 +99,10 @@ numbers; add `--json` for machine-readable output.
 ```
 # overall bounds / volume / watertight
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe bbox <PART.stl>
-# loops (with X/Y/Z extents) at planes ⟂ an axis — footprints at heights
+# loops at planes ⟂ an axis — extents + SHAPE per loop (<CIRCLE Ød> / <rect w x h>
+# / <profiled>). NEVER transcribe a loop's bbox without its shape tag: a circle's
+# bbox equals a square's, and bbox-transcription once shipped squared holes. A
+# <profiled> loop needs a closer look (slicepics) — often a rounded slot.
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe sections <PART.stl> --axis z --at 0.05,0.15,0.5 --frac
 # material extent in one plane, optionally inside a window (= form for negatives)
 PYTHONPATH=src ./.venv/bin/python -m stlstep.probe slice <PART.stl> --axis y --at 14.5 --window=-76,-54,0,20

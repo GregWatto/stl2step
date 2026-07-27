@@ -195,8 +195,16 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         pockets = []
 
     # 2) merge equal-signature holes/bosses into patterns
+    grouped_holes = _patternize(holes)
+    # 3) section-loop pass: recover small round holes segmentation missed
+    #    (thin-wall holes have too few triangles to fit a cylinder region, but
+    #    are unmissable as circular interior rings in cross-sections)
+    try:
+        grouped_holes.extend(_section_loop_holes(mesh, grouped_holes))
+    except Exception:  # noqa: BLE001 — recall pass is best-effort
+        pass
     features = {
-        "holes": _patternize(holes),
+        "holes": grouped_holes,
         "bosses": _patternize(bosses),
         "pockets": pockets,
         "thread_candidates": _thread_candidates(micro, diag),
@@ -524,3 +532,114 @@ def thread_signature(mesh, axis_dir, axis_pt, *, t_range=None, r_hint=None,
         out["spec_major_mm"] = best[1]
         out["spec_pitch_mm"] = best[2]
     return out
+
+
+# ----------------------------------------------------------------------------
+# Section-loop hole detection — recall independent of segmentation.
+#
+# A small round hole through a thin wall has a few dozen triangles; region
+# growing routinely absorbs or fragments it, so the cylinder-based grouping
+# above never sees it — and the feature gate can only demand what was detected
+# (an enclosure with 3 such holes shipped with them SQUARED because of exactly
+# this). But the same hole is unmissable in cross-section: a circular interior
+# ring of the material region. Slice densely along all three axes, circle-fit
+# every interior ring, cluster across stations, and emit the results as hole
+# features — arming the brief AND the feature gate.
+# ----------------------------------------------------------------------------
+
+def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
+    from shapely.geometry import Polygon
+    from .draw import _circle_fit_2d
+    cands = []
+    for axis in (0, 1, 2):
+        lo = float(mesh.bounds[0][axis]); hi = float(mesh.bounds[1][axis])
+        if hi - lo <= 1e-6:
+            continue
+        u, v = [i for i in (0, 1, 2) if i != axis]
+        from .featurecheck import _slice_region
+        for c in np.linspace(lo + 1e-3, hi - 1e-3, n):
+            region = _slice_region(mesh, axis, float(c))
+            if region is None:
+                continue
+            for g in getattr(region, "geoms", [region]):
+                for ring in getattr(g, "interiors", []):
+                    pts = np.asarray(ring.coords)[:, :2]
+                    if len(pts) < 8:
+                        continue
+                    try:
+                        area = abs(Polygon(ring).area)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if area < 1.0:
+                        continue
+                    cf = _circle_fit_2d(pts)
+                    if cf is None:
+                        continue
+                    cx, cy, r, resid = cf
+                    b = pts.min(axis=0), pts.max(axis=0)
+                    w, h = b[1] - b[0]
+                    aspect = max(w, h) / max(min(w, h), 1e-6)
+                    # strict circularity: tight fit, square bbox, Ø ≈ bbox,
+                    # area ≈ πr² — a rectangular vent fails all of these
+                    if (resid > 0.05 * r or aspect > 1.2
+                            or abs(2 * r - max(w, h)) > 0.3 * max(w, h)
+                            or abs(area - np.pi * r * r) > 0.2 * np.pi * r * r):
+                        continue
+                    cands.append({"axis": axis, "t": float(c),
+                                  "cu": float(cx), "cv": float(cy),
+                                  "r": float(r), "u": u, "v": v})
+    # cluster candidates: same axis, same centre (0.8mm), same r (12%)
+    holes = []
+    used = [False] * len(cands)
+    for i, a in enumerate(cands):
+        if used[i]:
+            continue
+        grp = [a]; used[i] = True
+        for j in range(i + 1, len(cands)):
+            bnd = cands[j]
+            if used[j] or bnd["axis"] != a["axis"]:
+                continue
+            if (abs(bnd["cu"] - a["cu"]) < 0.8 and abs(bnd["cv"] - a["cv"]) < 0.8
+                    and abs(bnd["r"] - a["r"]) < 0.12 * max(a["r"], 0.5)):
+                grp.append(bnd); used[j] = True
+        r = float(np.median([g["r"] for g in grp]))
+        cu = float(np.median([g["cu"] for g in grp]))
+        cv = float(np.median([g["cv"] for g in grp]))
+        ts = [g["t"] for g in grp]
+        pos = [0.0, 0.0, 0.0]
+        pos[a["axis"]] = round(max(ts), 2)
+        pos[a["u"]], pos[a["v"]] = round(cu, 2), round(cv, 2)
+        axis_vec = [0.0, 0.0, 0.0]; axis_vec[a["axis"]] = 1.0
+        holes.append({"axis": axis_vec, "diameter_mm": round(2 * r, 2),
+                      "depth_mm": round(max(max(ts) - min(ts), 0.5), 2),
+                      "through": None, "count": 1, "positions_mm": [pos],
+                      "arrangement": "single", "source": "section-loop"})
+    # dedupe vs cylinder-derived holes (same axis line + similar Ø)
+    out = []
+    for hnew in holes:
+        dup = False
+        for h in existing_holes:
+            if abs(h["diameter_mm"] - hnew["diameter_mm"]) > 0.3 * max(
+                    h["diameter_mm"], hnew["diameter_mm"]):
+                continue
+            if abs(float(np.dot(h["axis"], hnew["axis"]))) < 0.9:
+                continue
+            for p in h.get("positions_mm", []):
+                d = np.linalg.norm(np.asarray(p) - np.asarray(
+                    hnew["positions_mm"][0]))
+                if d < max(2.0, h["diameter_mm"]):
+                    dup = True
+        if not dup:
+            out.append(hnew)
+    # merge equal-signature section holes into patterns
+    merged = {}
+    for h in out:
+        key = (tuple(h["axis"]), round(h["diameter_mm"], 1))
+        if key in merged:
+            m = merged[key]
+            m["count"] += 1
+            m["positions_mm"].append(h["positions_mm"][0])
+            m["arrangement"] = "group"
+        else:
+            merged[key] = h
+    return list(merged.values())

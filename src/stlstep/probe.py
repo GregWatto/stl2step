@@ -113,11 +113,13 @@ def cmd_sections(m: trimesh.Trimesh, args) -> dict:
         for lp in loops:
             lp = np.asarray(lp, dtype=float)
             uu, vv = lp[:, u], lp[:, v]
-            plane["loops"].append({
+            rec = {
                 f"{names[u]}_min": float(uu.min()), f"{names[u]}_max": float(uu.max()),
                 f"{names[v]}_min": float(vv.min()), f"{names[v]}_max": float(vv.max()),
                 "centroid": [float(uu.mean()), float(vv.mean())],
-            })
+                "shape": _loop_shape(np.column_stack([uu, vv])),
+            }
+            plane["loops"].append(rec)
         result["planes"].append(plane)
     if not args.json:
         for pl in result["planes"]:
@@ -125,8 +127,35 @@ def cmd_sections(m: trimesh.Trimesh, args) -> dict:
             for lp in pl["loops"]:
                 print(f"    {names[u]}[{lp[names[u]+'_min']:.2f},{lp[names[u]+'_max']:.2f}]"
                       f" {names[v]}[{lp[names[v]+'_min']:.2f},{lp[names[v]+'_max']:.2f}]"
-                      f"  c={_fmt(lp['centroid'])}")
+                      f"  c={_fmt(lp['centroid'])}  <{lp['shape']}>")
     return result
+
+
+def _loop_shape(pts) -> str:
+    """Classify a section loop so extents are never read shape-blind: a CIRCLE's
+    bbox is identical to a square's — transcribing bboxes turned round holes into
+    squares once. Returns 'CIRCLE Ød', 'rect w x h', or 'profiled'."""
+    from shapely.geometry import Polygon
+    from .draw import _circle_fit_2d
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 6:
+        return "profiled"
+    w, h = pts.max(axis=0) - pts.min(axis=0)
+    try:
+        area = abs(Polygon(pts).area)
+    except Exception:  # noqa: BLE001
+        return "profiled"
+    if area < 1e-6:
+        return "profiled"
+    cf = _circle_fit_2d(pts)
+    if (cf is not None and cf[3] < 0.05 * cf[2]
+            and max(w, h) / max(min(w, h), 1e-6) < 1.2
+            and abs(2 * cf[2] - max(w, h)) < 0.3 * max(w, h)
+            and abs(area - np.pi * cf[2] ** 2) < 0.2 * np.pi * cf[2] ** 2):
+        return f"CIRCLE Ø{2 * cf[2]:.2f}"
+    if area > 0.92 * w * h:
+        return f"rect {w:.2f} x {h:.2f}"
+    return "profiled"
 
 
 def cmd_slice(m: trimesh.Trimesh, args) -> dict:
