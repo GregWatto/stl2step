@@ -336,19 +336,20 @@ def cmd_profile2d(m: trimesh.Trimesh, args) -> dict:
     # emit the snippet — sketch on the base cap (axis min) so the extrude lands
     # over the real part, not offset up from the section station
     plane = draw._PLANE[ai]
+    sg = draw._PSIGN[ai]
     base = lo if args.height is None else coord
     L = ["from build123d import *", "",
          f"# extruded profile: {args.axis}-section at {coord:.3f}, "
          f"height {height:.3f} mm from {args.axis}={base:.3f}  (facets + fillet arcs)",
          "with BuildPart() as part:",
-         f"    with BuildSketch(Plane.{plane}.offset({draw._fmt(base)})):"]
+         f"    with BuildSketch(Plane.{plane}.offset({draw._fmt(sg * base)})):"]
     for outer, holes in fitted:
         L.append("        # facet/fillet profile")
         L.extend(draw._emit_loop_lines(outer, "", 8))
         for h in holes:
             L.append("        # hole")
             L.extend(draw._emit_loop_lines(h, ", mode=Mode.SUBTRACT", 8))
-    L.append(f"    extrude(amount={draw._fmt(height)})")
+    L.append(f"    extrude(amount={draw._fmt(sg * height)})")
     snippet = "\n".join(L)
 
     out = {"axis": args.axis, "at_mm": coord, "height_mm": height,
@@ -453,7 +454,7 @@ def cmd_cutouts(m: trimesh.Trimesh, args) -> dict:
     straight into the model as code. The agent places; it never traces."""
     from shapely.geometry import Point
     from . import featurecheck as fc
-    from .draw import fit_loop, _emit_loop_lines, _fmt, _PLANE
+    from .draw import fit_loop, _emit_loop_lines, _fmt, _PLANE, _PSIGN
     ai = _axis(args.axis)
     u, v = _perp(ai)
     names = "xyz"
@@ -508,9 +509,9 @@ def cmd_cutouts(m: trimesh.Trimesh, args) -> dict:
                  f"({names[u]},{names[v]})=({cen.x:.2f},{cen.y:.2f}) — exact "
                  f"measured profile",
                  f"    with BuildSketch(Plane.{_PLANE[ai]}"
-                 f".offset({_fmt(w0 - 0.25)})):"]
+                 f".offset({_fmt(_PSIGN[ai] * (w0 - 0.25))})):"]
             L.extend(_emit_loop_lines(segs, "", 8))
-            L.append(f"    extrude(amount={_fmt(thk)}, mode=Mode.SUBTRACT)")
+            L.append(f"    extrude(amount={_fmt(_PSIGN[ai] * thk)}, mode=Mode.SUBTRACT)")
             L_all.append("\n".join(L))
     if L_all:
         print("\n--- paste-ready cuts (exact profiles — do NOT re-draw from "

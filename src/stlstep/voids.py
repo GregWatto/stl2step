@@ -197,11 +197,13 @@ def cut_snippet(feat: dict) -> str | None:
     if feat["shape"] not in ("circular", "annular") or feat["area_variation"] > 1.3:
         return None
     plane = {"x": "YZ", "y": "XZ", "z": "XY"}[feat["axis"]]
+    # build123d's Plane.XZ normal is -Y: negate offset + amount for the y axis
+    sg = -1.0 if feat["axis"] == "y" else 1.0
     z0, z1 = feat["span_mm"]
     cu, cv = feat["center_uv_mm"]
     L = [f"    # cavity: {feat['shape']} void, {feat['ends']}, "
          f"axis {feat['axis']} {z0}..{z1}",
-         f"    with BuildSketch(Plane.{plane}.offset({z0})):",
+         f"    with BuildSketch(Plane.{plane}.offset({sg * z0})):",
          f"        with Locations(({cu}, {cv})):"]
     if feat["shape"] == "circular":
         L.append(f"            Circle({feat['diameter_mm'] / 2})")
@@ -209,7 +211,7 @@ def cut_snippet(feat: dict) -> str | None:
         L.append(f"            Circle({feat['outer_diameter_mm'] / 2})")
         L.append(f"            Circle({feat['inner_diameter_mm'] / 2}, "
                  f"mode=Mode.SUBTRACT)")
-    L.append(f"    extrude(amount={round(z1 - z0, 3)}, mode=Mode.SUBTRACT)")
+    L.append(f"    extrude(amount={round(sg * (z1 - z0), 3)}, mode=Mode.SUBTRACT)")
     return "\n".join(L)
 
 

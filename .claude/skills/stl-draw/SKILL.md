@@ -199,6 +199,14 @@ Write a build123d script to `<WORKDIR>/attempt.py`:
   `with BuildPart() as part:` (the harness looks for `part`).
 - Work in millimetres, in the **same world coordinates as the analysis**, using
   the reported axes / diameters / centres / extents so the result overlays the mesh.
+- **build123d gotcha — `Plane.XZ` normal is (0,−1,0)**: `offset(+d)` lands at
+  world **y=−d**, and a positive extrude goes toward −Y (XY and YZ behave as
+  expected). All tool-EMITTED code (cutouts/profile2d/voids/feature trees)
+  already accounts for this. In YOUR own hand-written sketches on y-planes,
+  either negate (`Plane.XZ.offset(-y)` + negative amounts), or sidestep planes
+  entirely with `Locations((x, y, z))`-positioned `Box`/`Cylinder` — and trust
+  the verify colormap to catch a mirror (a y-wall cut in empty space shows as
+  missing-opening flags).
 - Model the **base first** (the dominant extrude or revolve — the biggest planes
   or the rotational profile), then add features: holes as `Circle(...) ,
   mode=Mode.SUBTRACT` extrudes on the right face/plane, bosses as adds, fillets

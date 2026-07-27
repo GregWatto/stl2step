@@ -535,15 +535,16 @@ def _prismatic_has_arcs(fitted):
 def _build_prismatic(pr, fitted):
     from build123d import BuildPart, BuildSketch, Plane, Mode, extrude
     base = getattr(Plane, _PLANE[pr.axis])
+    sg = _PSIGN[pr.axis]
     try:
         with BuildPart() as part:
             for lo, hi, lvl in fitted:
-                with BuildSketch(base.offset(lo)):
+                with BuildSketch(base.offset(sg * lo)):
                     for es, hs in lvl:
                         _sketch_loop(es, Mode.ADD)
                         for h in hs:
                             _sketch_loop(h, Mode.SUBTRACT)
-                extrude(amount=hi - lo)   # ADD: unions with the stack so far
+                extrude(amount=sg * (hi - lo))   # ADD: unions with the stack
         return part.part
     except Exception:  # noqa: BLE001 — a bad slab must not crash the dispatcher
         return None
@@ -551,18 +552,19 @@ def _build_prismatic(pr, fitted):
 
 def _emit_prismatic_script(pr, fitted):
     pl = _PLANE[pr.axis]
+    sg = _PSIGN[pr.axis]
     L = ["from build123d import *", "",
          f"# Reconstructed prismatic stack along {pl} normal, "
          f"{len(fitted)} levels (union of per-slab extrudes)", "",
          "with BuildPart() as part:"]
     for k, (lo, hi, lvl) in enumerate(fitted):
         L.append(f"    # level {k + 1}: {pl} offset {_fmt(lo)} -> {_fmt(hi)}")
-        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(lo)})):")
+        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(sg * lo)})):")
         for j, (es, hs) in enumerate(lvl):
             for grp, suffix in [(es, "")] + [(h, ", mode=Mode.SUBTRACT")
                                              for h in hs]:
                 L.extend(_emit_loop_lines(grp, suffix, 8))
-        L.append(f"    extrude(amount={_fmt(hi - lo)})")
+        L.append(f"    extrude(amount={_fmt(sg * (hi - lo))})")
     return "\n".join(L)
 
 
@@ -698,17 +700,18 @@ def _build_lofted(spec, fitted, idx):
     from build123d import (BuildPart, BuildSketch, Plane, Mode, loft)
     outer, holes = fitted
     base = getattr(Plane, _PLANE[spec.axis])
+    sg = _PSIGN[spec.axis]
     try:
         with BuildPart() as part:
             for i in idx:
                 coord, es = outer[i]
-                with BuildSketch(base.offset(coord)):
+                with BuildSketch(base.offset(sg * coord)):
                     _sketch_loop(es, Mode.ADD)
             loft()
             if holes:
                 for i in idx:
                     coord, hs = holes[i]
-                    with BuildSketch(base.offset(coord)):
+                    with BuildSketch(base.offset(sg * coord)):
                         _sketch_loop(hs, Mode.ADD)
                 loft(mode=Mode.SUBTRACT)
         return part.part
@@ -719,19 +722,20 @@ def _build_lofted(spec, fitted, idx):
 def _emit_lofted_script(spec, fitted, idx):
     outer, holes = fitted
     pl = _PLANE[spec.axis]
+    sg = _PSIGN[spec.axis]
     L = ["from build123d import *", "",
          f"# Reconstructed loft along {pl} normal through {len(idx)} sections",
          "", "with BuildPart() as part:"]
     for i in idx:
         coord, es = outer[i]
-        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(coord)})):")
+        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(sg * coord)})):")
         L.extend(_emit_loop_lines(es, "", 8))
     L.append("    loft()")
     if holes:
         L.append("    # through-hole lofted and subtracted")
         for i in idx:
             coord, hs = holes[i]
-            L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(coord)})):")
+            L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(sg * coord)})):")
             L.extend(_emit_loop_lines(hs, "", 8))
         L.append("    loft(mode=Mode.SUBTRACT)")
     return "\n".join(L)
@@ -873,7 +877,14 @@ def _spans_circle(P, cfit):
 # Draw: fitted profile -> build123d feature model + emitted script.
 # ----------------------------------------------------------------------------
 
+# build123d's named planes: YZ has normal +X and XY has normal +Z, but XZ has
+# normal (0,-1,0) — so offset(+d) lands at world y=-d and a positive extrude
+# goes toward -Y. Every emitter must negate offsets and extrude amounts for the
+# y axis (_PSIGN) or the geometry lands mirrored: this shipped y-wall cuts in
+# empty space before it was caught. Sketch-local (u,v) still map to the sorted
+# non-axis world dims for all three planes, so only the SIGNS need care.
 _PLANE = {0: "YZ", 1: "XZ", 2: "XY"}
+_PSIGN = {0: 1.0, 1: -1.0, 2: 1.0}
 
 
 def draw_extrusion(ext: Extrusion, mesh=None, *, dev_tol=0.1):
@@ -923,12 +934,13 @@ def _part_deviation(part, mesh):
 
 def _build_part(ext, loops):
     from build123d import BuildPart, BuildSketch, Plane, Mode, extrude
-    plane = getattr(Plane, _PLANE[ext.axis]).offset(ext.origin_offset)
+    s = _PSIGN[ext.axis]
+    plane = getattr(Plane, _PLANE[ext.axis]).offset(s * ext.origin_offset)
     with BuildPart() as part:
         with BuildSketch(plane):
             for i, segs in enumerate(loops):
                 _sketch_loop(segs, Mode.ADD if i == 0 else Mode.SUBTRACT)
-        extrude(amount=ext.length)
+        extrude(amount=s * ext.length)
     return part.part
 
 
@@ -992,12 +1004,12 @@ def _emit_script(ext, loops):
          f"length {_fmt(ext.length)} mm", "",
          "with BuildPart() as part:",
          f"    with BuildSketch(Plane.{_PLANE[ext.axis]}"
-         f".offset({_fmt(ext.origin_offset)})):"]
+         f".offset({_fmt(_PSIGN[ext.axis] * ext.origin_offset)})):"]
     for i, segs in enumerate(loops):
         mode = "" if i == 0 else ", mode=Mode.SUBTRACT"
         L.append(f"        # {'outer profile' if i == 0 else 'hole'}")
         L.extend(_emit_loop_lines(segs, mode, 8))
-    L.append(f"    extrude(amount={_fmt(ext.length)})")
+    L.append(f"    extrude(amount={_fmt(_PSIGN[ext.axis] * ext.length)})")
     return "\n".join(L)
 
 
