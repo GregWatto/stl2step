@@ -1,4 +1,4 @@
-# stl-step
+# stl2step
 
 Turn an STL triangle mesh back into **editable CAD**: a build123d feature tree
 plus a STEP file with real analytic surfaces — not re-skinned triangle soup.
@@ -209,3 +209,7 @@ Second attempt. The first (face-stitching BREP, no gates) produced
 dimensionally-plausible but broken CAD; its post-mortem — nothing may be
 dropped, edges must be real intersections, the gate must be per-feature and
 honest — became this project's spec. See `docs/v1-lessons.md`.
+
+## License
+
+[Apache 2.0](LICENSE)
