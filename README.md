@@ -6,12 +6,6 @@ An AI agent "draws" the part the way an engineer would (sketch → extrude →
 revolve → hole → fillet), while deterministic tools do everything agents are bad
 at: measuring, executing geometry, and refusing to accept a wrong answer.
 
-The design is the [img2threejs](https://github.com/img2threejs/img2threejs)
-gated *generate → verify → refine* loop, applied to reverse-engineering CAD:
-scripts enforce the gates; the model contributes only the judgment it is
-uniquely good at (reading a part, composing feature operations, deciding what a
-residual means).
-
 ## What it does
 
 - **Input**: an STL (CAD-exported or scanned; watertight not required).
@@ -22,55 +16,45 @@ residual means).
   deterministic gates — dimensional, volumetric, per-feature, and per-opening —
   before it is called done.
 
-Simple parts convert fully automatically. Complex parts are drawn by an agent
-(Claude Code via the bundled skill) iterating against the gates.
+Simple parts convert fully automatically. Complex parts are drawn by the agent
+iterating against the gates.
+
+## Quick start
+
+```bash
+git clone https://github.com/nickpagz/stl2step.git && cd stl2step
+python3.11 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+claude
+```
+
+Then just ask:
+
+> draw this stl: ~/Downloads/part.stl
+
+The bundled skill (`.claude/skills/stl-draw`) loads automatically when Claude
+Code runs in the repo and drives the whole loop — analysis, measurement,
+composition, gates, refinement, export.
 
 ## How it works
 
-```
-        STL mesh
-           │
-           ▼
- ┌─────────────────────┐   deterministic recognizers: extrusion, revolve,
- │ 1. RECOGNIZE        │──▶ prismatic stack, loft. Hit → exact feature tree,
- └─────────────────────┘   done in seconds (PASS) or best-effort (APPROX).
-           │ miss
-           ▼
- ┌─────────────────────┐   segmentation + grouped features (holes/bosses/
- │ 2. BRIEF            │   pockets/threads), edge treatments, INTERNAL CAVITY
- └─────────────────────┘   table, shaded views + cross-sections
-           │
-           ▼
- ┌─────────────────────┐   the probe toolbox: sections with per-loop SHAPE
- │ 3. MEASURE          │   tags, exact profile & cutout extraction (emitted as
- └─────────────────────┘   code — the agent places, it never traces), void
-           │               atlas, thread specs, dense slice zooms
-           ▼
- ┌─────────────────────┐   the agent composes a build123d script from the
- │ 4. COMPOSE          │   measurements; the OCCT kernel executes it
- └─────────────────────┘   deterministically
-           │
-           ▼
- ┌─────────────────────┐   deviation colormaps ("missing"/"extra"), size-
- │ 5. GATES            │   relative tolerance, feature completeness, slice
- └─────────────────────┘   occupancy (volumetric truth), per-loop opening
-           │ FAIL          shapes, thread-band awareness
-           │  └──────▶ localized findings (exact slice, centre, shape) ──┐
-           │ PASS                                                        │
-           ▼                                            back to 3/4 ─────┘
- ┌─────────────────────┐   every numeric literal in the script becomes a free
- │ 6. FIT              │   parameter; Powell optimisation snaps dimensions to
- └─────────────────────┘   the mesh (structure from the agent, millimetres
-           │               from math)
-           ▼
-   STEP + feature_tree.py
+```mermaid
+flowchart TD
+    A([STL mesh]) --> B{1 · RECOGNIZE<br/>extrusion · revolve · prismatic · loft}
+    B -- hit --> Z([STEP + feature_tree.py])
+    B -- miss --> C[2 · BRIEF<br/>grouped features · internal-cavity table<br/>edge treatments · views · cross-sections]
+    C --> D[3 · MEASURE<br/>shape-tagged sections · exact profiles & cutouts<br/>void atlas · thread specs · slice zooms]
+    D --> E[4 · COMPOSE<br/>agent writes a build123d script<br/>the OCCT kernel executes it]
+    E --> F{5 · GATES<br/>deviation colormaps · size-relative tolerance<br/>feature completeness · slice occupancy · opening shapes}
+    F -- "FAIL → localized findings<br/>(exact slice, centre, shape)" --> D
+    F -- PASS --> G[6 · FIT<br/>every numeric literal becomes a free parameter;<br/>Powell snaps dimensions to the mesh]
+    G --> Z
 ```
 
-Where img2threejs renders screenshots and uses agent **vision** as the judge,
-this pipeline's per-iteration judge is **geometric**: colormaps and slice
-overlays that say *where* and *how much*, not just "looks wrong". A
-matched-camera visual comparator exists as a final structural check, but the
-gates that block acceptance are all deterministic measurements.
+The per-iteration judge is **geometric**, not visual: deviation colormaps and
+slice overlays say *where* and *how much*, so every failure is a named, located
+finding rather than "looks wrong". A matched-camera visual comparator exists as
+a final structural check, but the gates that block acceptance are all
+deterministic measurements.
 
 ## The gates
 
@@ -83,7 +67,7 @@ shipped wrong without it:
 | Deviation ≤ 0.1% of bbox diagonal (both directions) | dimensional error, scaled to the part | a fixed mm bar is too slack for small parts |
 | Feature completeness | detected holes/bosses/fillets not modelled as *editable ops* | a missing fillet barely moves any distance metric |
 | Slice occupancy (IoU on all 3 axes) | internal cavities filled solid, dropped pockets, oversize bodies | surface distance can't see whether *space* is solid |
-| Per-loop opening shapes (scale-free) | a Ø4 hole modelled as a square (IoU 0.76), an HDMI trapezoid as its bounding box (boundary check) | p99 quantiles and %-volume floors dilute with part size |
+| Per-loop opening shapes (scale-free) | a Ø4 hole modelled as a square (IoU 0.76), a trapezoid port as its bounding box (boundary check) | p99 quantiles and %-volume floors dilute with part size |
 | Thread-band awareness | punishes neither: identified threads are modelled *nominal + spec*, and their bands are excluded from deviation/occupancy | a correct tap-drill hole "deviates" from the helix by design |
 
 Failures are **localized**: the exact slice coordinate, the opening's centre and
@@ -122,25 +106,6 @@ Threads are the one deliberate approximation: model the **nominal** hole/stud,
 record the spec (`M10x1.5`, `1/2-20 UNF`) — real CAD convention — and declare
 the band so the gates don't fight it.
 
-## Quick start
-
-```bash
-python3.11 -m venv .venv
-./.venv/bin/pip install -r requirements.txt
-
-# fully automatic (recognizers → best-effort feature model → BREP fallback):
-PYTHONPATH=src ./.venv/bin/python -m stlstep.convert part.stl -o part.step --report out/
-
-# agent-driven (the intended path for non-trivial parts):
-#   install the skill, then in Claude Code:  "draw this stl: part.stl"
-cp -r .claude/skills/stl-draw ~/.claude/skills/
-```
-
-`convert` prints `RESULT: PASS` (met tolerance), `RESULT: APPROX` (valid
-editable model over tolerance — the report says exactly where it deviates, you
-decide), or falls back to a watertight analytic-surface BREP (`--method solid`)
-that is exact but not feature-editable.
-
 ## What you get
 
 - `part.step` — the CAD file
@@ -148,6 +113,17 @@ that is exact but not feature-editable.
 - `report.json` / `metrics.json` — the full gate verdict
 - renders: deviation colormaps (missing/extra), slice-occupancy report,
   void atlas, matched-view comparison
+
+There is also a headless CLI for the fully-automatic path (no agent):
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m stlstep.convert part.stl -o part.step --report out/
+```
+
+It prints `RESULT: PASS` (met tolerance), `RESULT: APPROX` (valid editable
+model over tolerance — the report says exactly where it deviates, you decide),
+or falls back to a watertight analytic-surface BREP (`--method solid`) that is
+exact but not feature-editable.
 
 ## Results
 
@@ -164,7 +140,7 @@ Deterministic recognizers (no agent, seconds):
 On a 4,400-part CAD corpus, roughly a third of parts convert deterministically
 at < 0.1 mm. The rest route to the agent loop.
 
-Agent-in-the-loop (Claude Code + the skill, real parts):
+Agent-in-the-loop (real parts):
 
 | Part | Result |
 |---|---|
@@ -202,13 +178,6 @@ src/stlstep/
 tests/fixtures/            regression parts — one per fixed failure class
 eval/run_corpus.py         corpus scoring harness
 ```
-
-## Lineage
-
-Second attempt. The first (face-stitching BREP, no gates) produced
-dimensionally-plausible but broken CAD; its post-mortem — nothing may be
-dropped, edges must be real intersections, the gate must be per-feature and
-honest — became this project's spec. See `docs/v1-lessons.md`.
 
 ## License
 

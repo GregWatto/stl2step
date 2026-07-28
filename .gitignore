@@ -25,3 +25,8 @@ eval/*.local.json
 
 # editor config
 .vscode/
+
+# local working notes / reference material (not part of the published project)
+agent-context/
+docs/v1_ref/
+docs/
