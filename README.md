@@ -21,13 +21,17 @@ iterating against the gates.
 
 ## Quick start
 
+Prerequisites: Python 3.10–3.14 and [Claude Code](https://claude.com/claude-code).
+
 ```bash
 git clone https://github.com/nickpagz/stl2step.git && cd stl2step
-python3.11 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+./setup.sh
 claude
 ```
 
-Then just ask:
+`setup.sh` finds a suitable Python, creates the venv, installs the CAD stack,
+and verifies the kernel imports — with clear instructions if anything is
+missing. Then just ask:
 
 > draw this stl: ~/Downloads/part.stl
 
