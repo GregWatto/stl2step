@@ -210,6 +210,14 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         grouped_holes.extend(_section_loop_holes(mesh, grouped_holes))
     except Exception:  # noqa: BLE001 — recall pass is best-effort
         pass
+    # 4) open-bore pass: recover SLOTTED bores / rod saddles that a thin exterior
+    #    slot hides from the closed-ring section pass (a y-rod holder's Ø8 channel)
+    saddle_notes = []
+    try:
+        bores, saddle_notes = _open_bore_holes(mesh, grouped_holes, diag)
+        grouped_holes.extend(bores)
+    except Exception:  # noqa: BLE001 — recall pass is best-effort
+        pass
     features = {
         "holes": grouped_holes,
         "bosses": _patternize(bosses),
@@ -217,7 +225,7 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         "thread_candidates": _thread_candidates(micro, diag),
         "low_confidence_fits": _degenerate(surfaces, diag),
         "notes": ["round/oblique pockets and slots aren't grouped — read those "
-                  "off the cross-sections and the plane list"],
+                  "off the cross-sections and the plane list"] + saddle_notes,
     }
     return features
 
@@ -650,3 +658,193 @@ def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
         else:
             merged[key] = h
     return list(merged.values())
+
+
+def _robust_circle_fit(pts, iters=4):
+    """Iterative inlier-trimmed circle fit — rejects the straight side walls of a
+    saddle/slot so the fit locks onto the true circular arc. Returns
+    (cx, cy, r, resid, inlier_mask) or None."""
+    from .draw import _circle_fit_2d
+    keep = np.ones(len(pts), bool)
+    cf = _circle_fit_2d(pts)
+    for _ in range(iters):
+        if cf is None or keep.sum() < 6:
+            return None if cf is None else (*cf, keep)
+        cx, cy, r, _ = cf
+        err = np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)
+        thr = max(0.12 * r, float(np.median(err)) * 1.5)
+        nk = err < thr
+        if nk.sum() < 6 or nk.sum() == keep.sum():
+            keep = nk
+            break
+        keep = nk
+        cf = _circle_fit_2d(pts[keep])
+    return None if cf is None else (*cf, keep)
+
+
+def _axial_void_extent(mesh, axis, cu, cv, lo, hi, *, n=60):
+    """Longest contiguous void run along the line through (cu, cv) parallel to
+    `axis`, by point-in-solid testing. Returns (t_lo, t_hi), or (None, None) if
+    the containment test is unavailable (non-watertight mesh)."""
+    try:
+        ts = np.linspace(lo + 0.2, hi - 0.2, n)
+        pts = np.zeros((n, 3))
+        u, v = [i for i in (0, 1, 2) if i != axis]
+        pts[:, u] = cu; pts[:, v] = cv; pts[:, axis] = ts
+        void = ~mesh.contains(pts)
+        if not void.any():
+            return None, None
+        # longest run of consecutive void samples
+        best_lo = best_hi = None; best_len = 0; run_lo = None
+        for i, isvoid in enumerate(void):
+            if isvoid and run_lo is None:
+                run_lo = i
+            if (not isvoid or i == n - 1) and run_lo is not None:
+                run_hi = i if not isvoid else i
+                if ts[run_hi] - ts[run_lo] > best_len:
+                    best_len = ts[run_hi] - ts[run_lo]
+                    best_lo, best_hi = ts[run_lo], ts[run_hi]
+                run_lo = None
+        return best_lo, best_hi
+    except Exception:  # noqa: BLE001 — containment can fail on open meshes
+        return None, None
+
+
+def _open_bore_holes(mesh, existing_holes, diag, *, n=48) -> tuple[list, list]:
+    """Recall pass for SLOTTED / OPEN bores and rod saddles — the single biggest
+    class of missed feature on real parts (e.g. a y-rod holder's Ø8 channel).
+
+    `_section_loop_holes` only recovers CLOSED interior rings; a rod channel is a
+    bore that a thin slot opens to the outside, so its cross-section is a concave
+    arc in the OUTER boundary, not a closed ring — invisible to that pass. Here, in
+    cross-sections ⟂ each axis, we find exterior concavities (``hull.difference`` of
+    the section), keep only those whose void **connects to the exterior** (a real
+    chord shared with the convex hull — this is the discriminator vs. a bounded
+    counterbore/annulus, which `_section_loop_holes` already handles), and
+    robust-fit a circle to the arc (side walls trimmed as outliers). Coaxial fits
+    are clustered across slices.
+
+    Returns ``(holes, notes)``:
+      * holes — near-closed bores (arc span ≥ 330°): a slot broke the interior
+        ring, so these are true holes the section-loop pass missed. Same schema +
+        dedupe as `_section_loop_holes`; ``source="open-bore"``.
+      * notes — medium-confidence open saddles (150°–330°): genuinely
+        underspecified (half-pipe vs. fillet is ambiguous), left for the LLM to
+        confirm and place, as free-text lines.
+    """
+    from shapely.geometry import Point, Polygon
+    from .featurecheck import _slice_region
+    cands = []
+    for axis in (0, 1, 2):
+        lo = float(mesh.bounds[0][axis]); hi = float(mesh.bounds[1][axis])
+        if hi - lo <= 1e-6:
+            continue
+        u, v = [i for i in (0, 1, 2) if i != axis]
+        for c in np.linspace(lo + 0.5, hi - 0.5, n):
+            region = _slice_region(mesh, axis, float(c))
+            if region is None:
+                continue
+            for g in getattr(region, "geoms", [region]):
+                try:
+                    poly = Polygon(g.exterior)
+                    if poly.area < 40:
+                        continue
+                    hull = poly.convex_hull
+                    hb = hull.exterior
+                    defect = hull.difference(poly)
+                except Exception:  # noqa: BLE001 — one bad slice must not kill the pass
+                    continue
+                for d in getattr(defect, "geoms", [defect]):
+                    if d.is_empty or d.area < 4.0:
+                        continue
+                    # EXTERIOR-CONNECTED GUARD: the void must share a real chord
+                    # with the hull. Interior holes (bounded voids) share none —
+                    # they're the section-loop pass's job, not ours.
+                    chord = d.exterior.intersection(hb).length
+                    if chord < 0.8:
+                        continue
+                    bpts = np.asarray(d.exterior.coords)[:, :2]
+                    arc = bpts[np.array([hb.distance(Point(*p)) > 0.15
+                                         for p in bpts])]
+                    if len(arc) < 8:
+                        continue
+                    rf = _robust_circle_fit(arc)
+                    if rf is None:
+                        continue
+                    cx, cy, r, resid, keep = rf
+                    if r < 1.5 or r > 0.45 * diag or resid > 0.05 * r:
+                        continue
+                    a = arc[keep]
+                    span = float(np.degrees(np.ptp(np.unwrap(
+                        np.sort(np.arctan2(a[:, 1] - cy, a[:, 0] - cx))))))
+                    if span < 150 or chord > 1.4 * 2 * r:
+                        continue
+                    cands.append({"axis": axis, "t": float(c), "cu": float(cx),
+                                  "cv": float(cy), "r": float(r), "span": span,
+                                  "u": u, "v": v})
+    # cluster coaxial candidates: same axis, centre (1.2mm), r (15%)
+    holes, notes = [], []
+    used = [False] * len(cands)
+    for i, a in enumerate(cands):
+        if used[i]:
+            continue
+        grp = [a]; used[i] = True
+        for j in range(i + 1, len(cands)):
+            b = cands[j]
+            if used[j] or b["axis"] != a["axis"]:
+                continue
+            if (abs(b["cu"] - a["cu"]) < 1.2 and abs(b["cv"] - a["cv"]) < 1.2
+                    and abs(b["r"] - a["r"]) < 0.15 * max(a["r"], 0.5)):
+                grp.append(b); used[j] = True
+        lo = float(mesh.bounds[0][a["axis"]]); hi = float(mesh.bounds[1][a["axis"]])
+        ext = max(hi - lo, 1e-6)
+        if len(grp) < max(3, int(0.08 * n)):
+            continue
+        r = float(np.median([g["r"] for g in grp]))
+        cu = float(np.median([g["cu"] for g in grp]))
+        cv = float(np.median([g["cv"] for g in grp]))
+        max_span = max(g["span"] for g in grp)
+        ts = [g["t"] for g in grp]
+        run = (max(ts) - min(ts)) / ext
+        axis_vec = [0.0, 0.0, 0.0]; axis_vec[a["axis"]] = 1.0
+        pos = [0.0, 0.0, 0.0]
+        pos[a["u"]], pos[a["v"]] = round(cu, 2), round(cv, 2)
+        if max_span >= 330.0:
+            # a near-closed bore: emit as a hole. The clean-fit t-span
+            # under-measures depth (end-cap features contaminate the fit near the
+            # faces), so probe the axis line for the TRUE void extent instead.
+            v_lo, v_hi = _axial_void_extent(mesh, a["axis"], cu, cv, lo, hi)
+            if v_hi is None:                       # probe failed -> fall back
+                v_lo, v_hi = min(ts), max(ts)
+            through = (v_hi - v_lo) >= 0.8 * (hi - lo)
+            depth = max(v_hi - v_lo, 0.5)
+            pos[a["axis"]] = round(hi if through else v_hi, 2)
+            holes.append({"axis": axis_vec, "diameter_mm": round(2 * r, 2),
+                          "depth_mm": round(depth, 2),
+                          "through": (True if through else None), "count": 1,
+                          "positions_mm": [pos], "arrangement": "single",
+                          "source": "open-bore"})
+        else:
+            notes.append(
+                f"OPEN SADDLE Ø{2 * r:.1f} at ({cu:.1f},{cv:.1f}) axis "
+                f"{'xyz'[a['axis']]} (arc {max_span:.0f}°, ~{run * 100:.0f}% of "
+                f"length) — half-open rod rest/scallop; confirm & place from a "
+                f"probe section")
+    # dedupe recovered bores vs cylinder- and section-derived holes
+    out = []
+    for hnew in holes:
+        dup = False
+        for h in existing_holes:
+            if abs(h["diameter_mm"] - hnew["diameter_mm"]) > 0.3 * max(
+                    h["diameter_mm"], hnew["diameter_mm"]):
+                continue
+            if abs(float(np.dot(h["axis"], hnew["axis"]))) < 0.9:
+                continue
+            for p in h.get("positions_mm", []):
+                d = np.linalg.norm(np.asarray(p) - np.asarray(
+                    hnew["positions_mm"][0]))
+                if d < max(2.0, h["diameter_mm"]):
+                    dup = True
+        if not dup:
+            out.append(hnew)
+    return out, notes
