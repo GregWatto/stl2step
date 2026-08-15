@@ -921,10 +921,11 @@ def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
     extrude_axis = np.zeros(3); extrude_axis[ai] = 1.0
     lines = [base, "", "    # === auto-emitted features from analysis ===",
              "    # holes: exact position + axis + diameter (all axes)"]
-    nh = 0; skipped = []
+    nh = 0; nct = 0; skipped = []
     for h in feats.get("holes", []):
         dia = float(h["diameter_mm"]); ax = h["axis"]
         L = diag * 1.2 if h.get("through") else float(h.get("depth_mm") or diag)
+        cut_positions = []
         for p in h["positions_mm"]:
             if h.get("source") == "open-bore":
                 parallel = abs(float(np.dot(np.asarray(ax, float),
@@ -943,6 +944,33 @@ def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
             lines.append(f"        Cylinder(radius={dia / 2:.4f}, height={L:.4f}, "
                          f"mode=Mode.SUBTRACT)")
             nh += 1
+            cut_positions.append(p)
+        # counterbore / countersink at the mouths — at EVERY cut instance of the
+        # pattern (the treatment is measured once but applies to all like holes)
+        axv = np.asarray(ax, float); ai_h = int(np.argmax(np.abs(axv)))
+        into = np.sign(axv[ai_h]) if axv[ai_h] else 1.0
+        for t in h.get("end_treatments", []):
+            major = t["major_dia_mm"]; dep = t["depth_mm"]
+            zd = [0.0, 0.0, 0.0]
+            zd[ai_h] = float(into) if t["end"] == "lo" else -float(into)
+            for p in cut_positions:
+                o = list(p); o[ai_h] = t["face_mm"]
+                lines.append(
+                    f"    with Locations(Plane(origin=({o[0]:.4f}, {o[1]:.4f}, "
+                    f"{o[2]:.4f}), z_dir=({zd[0]:.1f}, {zd[1]:.1f}, "
+                    f"{zd[2]:.1f}))):")
+                if t["kind"] == "counterbore":
+                    lines.append(
+                        f"        Cylinder(radius={major / 2:.4f}, "
+                        f"height={dep:.4f}, align=(Align.CENTER, Align.CENTER, "
+                        f"Align.MIN), mode=Mode.SUBTRACT)  # counterbore")
+                else:  # countersink: cone, wide at the face -> nominal at depth
+                    lines.append(
+                        f"        Cone(bottom_radius={major / 2:.4f}, "
+                        f"top_radius={dia / 2:.4f}, height={dep:.4f}, "
+                        f"align=(Align.CENTER, Align.CENTER, Align.MIN), "
+                        f"mode=Mode.SUBTRACT)  # countersink")
+                nct += 1
     if skipped:
         lines.append("    # recovered open-bores NOT auto-cut (left for the LLM):")
         lines += skipped
@@ -1000,7 +1028,7 @@ def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
                      "probe) ===")
         lines += ["    " + t for t in todo]
 
-    stats = {"holes": nh, "bosses": nb, "pockets": npk,
+    stats = {"holes": nh, "counterbores": nct, "bosses": nb, "pockets": npk,
              "skipped_bores": len(skipped), "todos": len(todo),
              "base_station_volume_mm3": round(best_v, 1)}
     return "\n".join(lines) + "\n", stats
@@ -1023,7 +1051,8 @@ def _cli_emit(args) -> int:
     with open(out, "w") as fp:
         fp.write(script)
     print(f"scaffold written to {out}")
-    print(f"  auto-emitted: {stats['holes']} hole-cut(s), {stats['bosses']} "
+    print(f"  auto-emitted: {stats['holes']} hole-cut(s), "
+          f"{stats['counterbores']} counterbore/countersink(s), {stats['bosses']} "
           f"boss(es), {stats['pockets']} pocket(s)")
     if stats["skipped_bores"]:
         print(f"  {stats['skipped_bores']} recovered open-bore(s) left as notes "

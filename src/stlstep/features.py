@@ -218,6 +218,11 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         grouped_holes.extend(bores)
     except Exception:  # noqa: BLE001 — recall pass is best-effort
         pass
+    # 5) end-treatment pass: counterbore / countersink at each hole's mouths
+    try:
+        _hole_end_treatments(mesh, grouped_holes)
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
     features = {
         "holes": grouped_holes,
         "bosses": _patternize(bosses),
@@ -658,6 +663,76 @@ def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
         else:
             merged[key] = h
     return list(merged.values())
+
+
+def _ring_dia_at(mesh, ai, t, cu, cv):
+    """Largest interior-ring Ø on the plane ⟂ axis `ai` at `t`, centred near
+    (cu, cv). None if no clean ring there. Used to profile a hole's radius vs
+    depth so an end flare (counterbore/countersink) can be measured."""
+    from .draw import _circle_fit_2d
+    from .featurecheck import _slice_region
+    reg = _slice_region(mesh, ai, float(t))
+    if reg is None:
+        return None
+    best = None
+    for g in getattr(reg, "geoms", [reg]):
+        for ring in getattr(g, "interiors", []):
+            pts = np.asarray(ring.coords)[:, :2]
+            if len(pts) < 6:
+                continue
+            cf = _circle_fit_2d(pts)
+            if cf is None:
+                continue
+            cx, cy, r, resid = cf
+            if abs(cx - cu) < 1.5 and abs(cy - cv) < 1.5 and resid < 0.15 * r:
+                if best is None or r > best:
+                    best = r
+    return None if best is None else 2 * best
+
+
+def _hole_end_treatments(mesh, holes) -> None:
+    """Detect a counterbore (a coaxial STEP to a wider Ø) or countersink (a
+    coaxial conical RAMP) at each hole's ends and attach an ``end_treatments``
+    list to the hole in place. This recovers the shallow chamfered screw-hole
+    mouths the cylinder segmenter drops as fragments, AND the deeper nut-seat
+    counterbores — by profiling the hole's interior-ring Ø vs depth from each face
+    rather than relying on a second cylinder being segmented.
+
+    Each treatment: ``{end, kind, major_dia_mm, depth_mm, face_mm}`` where `kind`
+    is ``"counterbore"`` (Ø roughly constant + wider → a cylindrical recess) or
+    ``"countersink"`` (Ø ramps toward the face → a cone), `face_mm` is the face's
+    coordinate along the hole axis, and `depth_mm` runs into the part from it."""
+    for h in holes:
+        ax = np.asarray(h["axis"], float)
+        ai = int(np.argmax(np.abs(ax)))
+        u, v = [i for i in (0, 1, 2) if i != ai]
+        p = np.asarray(h["positions_mm"][0], float)
+        cu, cv = p[u], p[v]
+        nominal = float(h["diameter_mm"])
+        lo = float(mesh.bounds[0][ai]); hi = float(mesh.bounds[1][ai])
+        treatments = []
+        for end, face, step in (("lo", lo, +1.0), ("hi", hi, -1.0)):
+            prof = []
+            for dd in np.arange(0.05, 2.2, 0.12):
+                dia = _ring_dia_at(mesh, ai, face + step * dd, cu, cv)
+                if dia is not None:
+                    prof.append((dd, dia))
+            if len(prof) < 3:
+                continue
+            prof = np.asarray(prof)
+            wide = prof[prof[:, 1] > nominal * 1.08]
+            if len(wide) < 2 or wide[:, 1].max() > 3.0 * nominal:
+                continue  # no flare, or a spurious huge jump (not a bore mouth)
+            major = float(wide[:, 1].max())
+            depth = float(wide[:, 0].max()) + 0.12   # to where Ø returns to nominal
+            slope = float(np.polyfit(wide[:, 0], wide[:, 1], 1)[0])
+            kind = "countersink" if slope < -0.4 else "counterbore"
+            treatments.append({"end": end, "kind": kind,
+                               "major_dia_mm": round(major, 2),
+                               "depth_mm": round(depth, 2),
+                               "face_mm": round(face, 3)})
+        if treatments:
+            h["end_treatments"] = treatments
 
 
 def _robust_circle_fit(pts, iters=4):
