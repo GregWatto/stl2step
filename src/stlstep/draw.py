@@ -997,6 +997,61 @@ def _emit_loop_lines(segs, mode_suffix, indent):
     return L
 
 
+def profile2d_snippet(mesh, axis, coord, height=None):
+    """Fit the cross-section ⟂ `axis` at `coord` to straight facets + fillet arcs
+    and emit a paste-ready build123d extrude snippet. Shared by `probe profile2d`
+    and `compose emit`. Returns ``(snippet, summary)`` or ``(None, [])`` if no loop
+    fits. `height` defaults to the full axial extent (sketch on the axis-min cap so
+    the extrude lands over the real part); pass an explicit height to sketch at the
+    station instead."""
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    polys = _section_polys(mesh, axis, coord)
+    if not polys:
+        return None, []
+    h = height if height is not None else (hi - lo)
+    fitted, summary = [], []
+    for exterior, interiors in polys:
+        outer = fit_loop(exterior, arcs=True)
+        holes = [fit_loop(hl, arcs=True) for hl in interiors]
+        holes = [hl for hl in holes if hl]
+        if not outer:
+            continue
+        fitted.append((outer, holes))
+
+        def _tally(segs):
+            lines = sum(1 for s in segs if s.kind == "line")
+            arcs = [s.radius for s in segs if s.kind == "arc"]
+            circ = [s.radius for s in segs if s.kind == "circle"]
+            return lines, arcs, circ
+        ol, oa, oc = _tally(outer)
+        summary.append({"loop": "outer", "facets": ol,
+                        "fillets": [round(r, 2) for r in oa],
+                        "circle_r": [round(r, 2) for r in oc]})
+        for k, hl in enumerate(holes):
+            tl, ta, tc = _tally(hl)
+            summary.append({"loop": f"hole{k + 1}", "facets": tl,
+                            "fillets": [round(r, 2) for r in ta],
+                            "circle_r": [round(r, 2) for r in tc]})
+    if not fitted:
+        return None, []
+    plane = _PLANE[axis]
+    sg = _PSIGN[axis]
+    base = lo if height is None else coord
+    L = ["from build123d import *", "",
+         f"# extruded profile: {'xyz'[axis]}-section at {coord:.3f}, "
+         f"height {h:.3f} mm from {'xyz'[axis]}={base:.3f}  (facets + fillet arcs)",
+         "with BuildPart() as part:",
+         f"    with BuildSketch(Plane.{plane}.offset({_fmt(sg * base)})):"]
+    for outer, holes in fitted:
+        L.append("        # facet/fillet profile")
+        L.extend(_emit_loop_lines(outer, "", 8))
+        for hl in holes:
+            L.append("        # hole")
+            L.extend(_emit_loop_lines(hl, ", mode=Mode.SUBTRACT", 8))
+    L.append(f"    extrude(amount={_fmt(sg * h)})")
+    return "\n".join(L), summary
+
+
 def _emit_script(ext, loops):
     """Emit a readable, runnable build123d feature script — the feature tree."""
     L = ["from build123d import *", "",

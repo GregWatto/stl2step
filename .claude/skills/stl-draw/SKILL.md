@@ -192,9 +192,34 @@ plate + thin walls of differing height, like a corner holder), take a section in
 each level — the thin-wall band, the base plate, the post — and stack the
 extrudes; each `point`-check the front to confirm which sides are walled.
 
+### 2c. Seed a scaffold from detected features (`compose emit`)
+
+Before hand-writing anything, let the deterministic side emit what it already
+knows, so you start from geometry-true structure instead of transcribing numbers
+by hand (which mis-places holes):
+
+```bash
+PYTHONPATH=src ./.venv/bin/python -m stlstep.compose emit <PART.stl> <WORKDIR>
+# -> WORKDIR/scaffold.py   (reuses WORKDIR/analysis.json if `brief` already ran)
+```
+
+The scaffold is the **profile2d base (max cross-section, extruded along the
+prismatic axis) + every detected hole auto-placed** (all axes, exact position +
+axis + Ø + through/depth — the error-prone part), bosses/pockets where known, and
+explicit `TODO` comments for what the analysis can't place (fillets, chamfers,
+under-placed pockets, and open-saddle candidates). Recovered **open-bores / rod
+channels** (a slotted bore the closed-ring pass misses) are auto-cut only when
+their axis ∥ the extrude axis and the base is solid there; otherwise they're left
+as a note for you to confirm and place from a section.
+
+Copy `scaffold.py` to `attempt.py`, then **verify it immediately** (§4) to see the
+starting deviation, and refine from there. The scaffold is a seed, not an answer —
+its base FORM is a single-station extrude, so level-varying parts still need you.
+
 ### 3. Compose a build123d script (this is the "drawing")
 
-Write a build123d script to `<WORKDIR>/attempt.py`:
+Start from `<WORKDIR>/scaffold.py` (§2c) when it exists; otherwise write
+`<WORKDIR>/attempt.py` from scratch:
 - Start with `from build123d import *`, and leave the solid in
   `with BuildPart() as part:` (the harness looks for `part`).
 - Work in millimetres, in the **same world coordinates as the analysis**, using

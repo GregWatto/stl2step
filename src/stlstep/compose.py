@@ -845,6 +845,196 @@ def _surf_line(s: dict) -> str:
     return f"freeform (curved)  bbox {s['bbox_min_mm']}->{s['bbox_max_mm']}  area={s['area_mm2']}"
 
 
+def _base_solid_along(base_mesh, p, ax) -> bool:
+    """True if the base is (mostly) SOLID along the bore axis at p — the bore is
+    MISSING from the base and worth carving. False if already void there (the
+    silhouette has it -> re-carving would double-cut) or if we can't confirm (the
+    bore centre falls outside the base footprint -> a straight cut isn't trusted).
+    This is the guard that keeps recovered open-bores from over-carving."""
+    if base_mesh is None:
+        return True
+    axv = np.asarray(ax, float); axv = axv / (np.linalg.norm(axv) or 1.0)
+    lo_b, hi_b = base_mesh.bounds
+    reach = float(np.linalg.norm(hi_b - lo_b))
+    ts = np.linspace(-reach, reach, 60)
+    pts = np.asarray(p, float)[None, :] + ts[:, None] * axv[None, :]
+    inside = (pts >= lo_b - 1e-6).all(1) & (pts <= hi_b + 1e-6).all(1)
+    if inside.sum() < 4:
+        return False
+    try:
+        return float(base_mesh.contains(pts[inside]).mean()) > 0.4
+    except Exception:  # noqa: BLE001 — can't confirm -> don't carve
+        return False
+
+
+def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
+    """Deterministic feature -> build123d scaffold: the reliable, fully-specified
+    part of the model, emitted as a clean editable feature tree so the LLM starts
+    from geometry-true structure instead of hand-transcribing (and mis-placing) it.
+
+    * BASE  = the profile2d station with the LARGEST cross-section (outer envelope
+      before top-face pockets/chamfers shrink it), extruded along the prismatic axis.
+    * HOLES = every detected hole as an oriented Cylinder SUBTRACT (all axes, exact
+      position + axis + Ø + through/depth) — the error-prone part hand-modelling
+      gets wrong. Recovered open-bores (rod channels) are auto-cut ONLY when their
+      axis ∥ the extrude axis AND the base is solid there (else -> LLM note).
+    * BOSSES as ADDs; POCKETS as oriented Box SUBTRACTs where a centre is known.
+    Fillets/chamfers and under-placed features are left as explicit TODO comments —
+    the LLM's remaining job, spelled out. Returns ``(script, stats)``."""
+    from build123d import export_stl
+    from . import draw
+    bb = analysis["bounding_box"]
+    lo = np.asarray(bb["min"], float); hi = np.asarray(bb["max"], float)
+    diag = float(np.linalg.norm(hi - lo))
+    axis = (analysis["deterministic_recognizers"].get("prismatic") or {}).get(
+        "axis", "z")
+    ai = {"x": 0, "y": 1, "z": 2}[axis]
+    span = hi[ai] - lo[ai]
+    feats = analysis.get("features", {})
+
+    # 1. base outer form = max cross-section station
+    best_v, base = -1.0, ""
+    for frac in (0.12, 0.25, 0.4, 0.55, 0.7, 0.85):
+        station = lo[ai] + frac * span
+        snip, _ = draw.profile2d_snippet(mesh, ai, float(station))
+        if not snip:
+            continue
+        try:
+            v = abs(float(exec_script(snip).volume))
+        except Exception:  # noqa: BLE001 — a bad station just loses the scan
+            v = 0.0
+        if v > best_v:
+            best_v, base = v, snip
+    if not base:
+        raise ValueError("profile2d produced no base snippet for any station")
+
+    # base solid -> mesh, so open-bores can be gated on base solidity
+    base_mesh = None
+    try:
+        import tempfile
+        tf = tempfile.NamedTemporaryFile(suffix=".stl", delete=False); tf.close()
+        export_stl(exec_script(base), tf.name)
+        base_mesh = trimesh.load(tf.name)
+    except Exception:  # noqa: BLE001 — guard is best-effort
+        base_mesh = None
+
+    extrude_axis = np.zeros(3); extrude_axis[ai] = 1.0
+    lines = [base, "", "    # === auto-emitted features from analysis ===",
+             "    # holes: exact position + axis + diameter (all axes)"]
+    nh = 0; skipped = []
+    for h in feats.get("holes", []):
+        dia = float(h["diameter_mm"]); ax = h["axis"]
+        L = diag * 1.2 if h.get("through") else float(h.get("depth_mm") or diag)
+        for p in h["positions_mm"]:
+            if h.get("source") == "open-bore":
+                parallel = abs(float(np.dot(np.asarray(ax, float),
+                                            extrude_axis))) > 0.9
+                if not (parallel and _base_solid_along(base_mesh, p, ax)):
+                    why = ("axis ⟂ extrude — base can't hold it" if not parallel
+                           else "base silhouette already has it")
+                    skipped.append(
+                        f"    #   OPEN-BORE Ø{dia:.2f} at "
+                        f"{tuple(round(x, 2) for x in p)} axis {ax} — {why}; "
+                        f"LLM to verify/place")
+                    continue
+            lines.append(
+                f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
+                f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}))):")
+            lines.append(f"        Cylinder(radius={dia / 2:.4f}, height={L:.4f}, "
+                         f"mode=Mode.SUBTRACT)")
+            nh += 1
+    if skipped:
+        lines.append("    # recovered open-bores NOT auto-cut (left for the LLM):")
+        lines += skipped
+
+    nb = 0
+    for b in feats.get("bosses", []):
+        dia = float(b.get("diameter_mm", 0)); ax = b.get("axis", [0, 0, 1])
+        L = float(b.get("height_mm") or b.get("depth_mm") or 1)
+        for p in b.get("positions_mm", []):
+            lines.append(
+                f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
+                f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}))):")
+            lines.append(f"        Cylinder(radius={dia / 2:.4f}, height={L:.4f}, "
+                         f"mode=Mode.ADD)")
+            nb += 1
+
+    npk = 0
+    if feats.get("pockets"):
+        lines.append("    # pockets: centre + size + depth on the opening face")
+    for p in feats.get("pockets", []):
+        c = p.get("center_mm")
+        if not c:
+            continue
+        n = p["opening_normal"]; w, ht = p["size_mm"]; depth = float(p["depth_mm"])
+        ax = p.get("plane_axes")
+        xdir = (f", x_dir=({ax[0][0]:.4f}, {ax[0][1]:.4f}, {ax[0][2]:.4f})"
+                if ax else "")
+        lines.append(f"    with Locations(Plane(origin=({c[0]:.4f}, {c[1]:.4f}, "
+                     f"{c[2]:.4f}){xdir}, z_dir=({n[0]:.4f}, {n[1]:.4f}, "
+                     f"{n[2]:.4f}))):")
+        lines.append(f"        Box({w:.4f}, {ht:.4f}, {depth + 2:.4f}, "
+                     f"mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, "
+                     f"Align.MIN))")
+        npk += 1
+
+    # what the analysis still can't place precisely — the LLM's remaining job
+    todo = []
+    for p in feats.get("pockets", []):
+        if not p.get("center_mm"):
+            todo.append(f"#   POCKET {p['size_mm']} depth {p['depth_mm']} normal "
+                        f"{p['opening_normal']} — no centre; place from a section")
+    for note in feats.get("notes", []):
+        if "SADDLE" in note:
+            todo.append("#   " + note)
+    et = analysis.get("edge_treatments", {})
+    for f in et.get("fillets", []):
+        todo.append(f"#   FILLET r={f.get('radius_mm')} x{f.get('count')} — "
+                    f"locations not detected; add on the relevant edges")
+    for c in et.get("chamfers", []):
+        todo.append(f"#   CHAMFER x{c.get('count')} — locations not detected; "
+                    f"add on the relevant edges")
+    if todo:
+        lines.append("")
+        lines.append("    # === TODO (underspecified — LLM to place, measure with "
+                     "probe) ===")
+        lines += ["    " + t for t in todo]
+
+    stats = {"holes": nh, "bosses": nb, "pockets": npk,
+             "skipped_bores": len(skipped), "todos": len(todo),
+             "base_station_volume_mm3": round(best_v, 1)}
+    return "\n".join(lines) + "\n", stats
+
+
+def _cli_emit(args) -> int:
+    from .ingest import load_and_repair
+    ing = load_and_repair(args.stl)
+    apath = os.path.join(args.workdir, "analysis.json")
+    if os.path.exists(apath):
+        with open(apath) as fp:
+            analysis = json.load(fp)
+    else:
+        os.makedirs(args.workdir, exist_ok=True)
+        analysis = analyze(ing.mesh)
+        with open(apath, "w") as fp:
+            json.dump(analysis, fp, indent=2)
+    script, stats = build_scaffold(ing.mesh, analysis)
+    out = args.out or os.path.join(args.workdir, "scaffold.py")
+    with open(out, "w") as fp:
+        fp.write(script)
+    print(f"scaffold written to {out}")
+    print(f"  auto-emitted: {stats['holes']} hole-cut(s), {stats['bosses']} "
+          f"boss(es), {stats['pockets']} pocket(s)")
+    if stats["skipped_bores"]:
+        print(f"  {stats['skipped_bores']} recovered open-bore(s) left as notes "
+              f"(axis ⟂ extrude / base already has it)")
+    print(f"  {stats['todos']} feature(s) left as TODO for the LLM "
+          f"(fillets/chamfers/under-placed)")
+    print("  -> verify with:  compose run "
+          f"{args.stl} {args.workdir} {out}")
+    return 0
+
+
 def _cli_brief(args) -> int:
     from .ingest import load_and_repair
     ing = load_and_repair(args.stl)
@@ -1227,6 +1417,14 @@ def main(argv=None) -> int:
     b = sub.add_parser("brief", help="analyze an STL and render views for drawing")
     b.add_argument("stl"); b.add_argument("workdir")
     b.set_defaults(fn=_cli_brief)
+
+    e = sub.add_parser("emit", help="seed a build123d scaffold from detected "
+                                    "features (profile2d base + holes/pockets + "
+                                    "TODO notes) for the LLM to finish")
+    e.add_argument("stl"); e.add_argument("workdir")
+    e.add_argument("--out", default=None,
+                   help="write the scaffold here (default: WORKDIR/scaffold.py)")
+    e.set_defaults(fn=_cli_emit)
 
     r = sub.add_parser("run", help="execute + verify a proposed build123d script")
     r.add_argument("stl"); r.add_argument("workdir"); r.add_argument("script")

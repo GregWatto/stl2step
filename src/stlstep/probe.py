@@ -301,61 +301,18 @@ def cmd_profile2d(m: trimesh.Trimesh, args) -> dict:
         coord = lo + args.at * (hi - lo)
     else:
         coord = args.at
-    polys = draw._section_polys(m, ai, coord)
-    if not polys:
-        raise SystemExit(f"no cross-section at {args.axis}={coord:.3f}")
     height = args.height if args.height is not None else (hi - lo)
-
-    fitted, summary = [], []
-    for exterior, interiors in polys:
-        outer = draw.fit_loop(exterior, arcs=True)
-        holes = [draw.fit_loop(h, arcs=True) for h in interiors]
-        holes = [h for h in holes if h]
-        if not outer:
-            continue
-        fitted.append((outer, holes))
-
-        def _tally(segs):
-            lines = sum(1 for s in segs if s.kind == "line")
-            arcs = [s.radius for s in segs if s.kind == "arc"]
-            circ = [s.radius for s in segs if s.kind == "circle"]
-            return lines, arcs, circ
-        ol, oa, oc = _tally(outer)
-        summary.append({"loop": "outer", "facets": ol,
-                        "fillets": [round(r, 2) for r in oa],
-                        "circle_r": [round(r, 2) for r in oc]})
-        for k, h in enumerate(holes):
-            hl, ha, hc = _tally(h)
-            summary.append({"loop": f"hole{k+1}", "facets": hl,
-                            "fillets": [round(r, 2) for r in ha],
-                            "circle_r": [round(r, 2) for r in hc]})
-
-    if not fitted:
-        raise SystemExit("cross-section found but no loop could be fitted")
-
-    # emit the snippet — sketch on the base cap (axis min) so the extrude lands
-    # over the real part, not offset up from the section station
-    plane = draw._PLANE[ai]
-    sg = draw._PSIGN[ai]
-    base = lo if args.height is None else coord
-    L = ["from build123d import *", "",
-         f"# extruded profile: {args.axis}-section at {coord:.3f}, "
-         f"height {height:.3f} mm from {args.axis}={base:.3f}  (facets + fillet arcs)",
-         "with BuildPart() as part:",
-         f"    with BuildSketch(Plane.{plane}.offset({draw._fmt(sg * base)})):"]
-    for outer, holes in fitted:
-        L.append("        # facet/fillet profile")
-        L.extend(draw._emit_loop_lines(outer, "", 8))
-        for h in holes:
-            L.append("        # hole")
-            L.extend(draw._emit_loop_lines(h, ", mode=Mode.SUBTRACT", 8))
-    L.append(f"    extrude(amount={draw._fmt(sg * height)})")
-    snippet = "\n".join(L)
+    snippet, summary = draw.profile2d_snippet(
+        m, ai, coord, height=(args.height if args.height is not None else None))
+    if snippet is None:
+        raise SystemExit(
+            f"no fittable cross-section at {args.axis}={coord:.3f}")
+    n_polygons = snippet.count("# facet/fillet profile")
 
     out = {"axis": args.axis, "at_mm": coord, "height_mm": height,
-           "n_polygons": len(fitted), "loops": summary, "snippet": snippet}
+           "n_polygons": n_polygons, "loops": summary, "snippet": snippet}
     if not args.json:
-        print(f"{args.axis}-section at {coord:.3f}  ->  {len(fitted)} region(s), "
+        print(f"{args.axis}-section at {coord:.3f}  ->  {n_polygons} region(s), "
               f"extrude height {height:.3f} mm")
         for s in summary:
             fil = (f"  fillets r={s['fillets']}" if s['fillets'] else "")
