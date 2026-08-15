@@ -22,10 +22,14 @@ def bbox_diagonal(mesh) -> float:
     return float(np.linalg.norm(hi - lo))
 
 
-def size_tol(mesh, *, frac: float = 0.0015, floor: float = 0.03) -> float:
-    """Deviation tolerance scaled to the part: `frac` of the bbox diagonal, with
-    an absolute floor near mesh resolution. A 1 mm error is huge on a 10 mm part
-    and negligible on a 400 mm part — this makes the accept bar reflect that."""
+def size_tol(mesh, *, frac: float = 0.0015, floor: float = 0.10) -> float:
+    """Deviation tolerance scaled to the part: `frac` (0.15%) of the bbox diagonal,
+    with an absolute `floor` at the project's nominal 0.1 mm accept bar. A 1 mm
+    error is huge on a 10 mm part and negligible on a 400 mm part — the size term
+    reflects that — but the floor stops the bar dropping BELOW 0.1 mm on small
+    parts, where 0.15%-of-diagonal (0.035 mm on a 23 mm cover) is finer than FDM
+    print/mesh resolution can support and made tiny parts disproportionately hard.
+    Above ~67 mm the size term dominates; at/below it the 0.1 mm floor holds."""
     return max(floor, frac * bbox_diagonal(mesh))
 
 

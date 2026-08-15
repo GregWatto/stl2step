@@ -1335,7 +1335,7 @@ def _cli_run(args) -> int:
     # size-relative tolerance: a fixed mm bar is wrong across scales.
     tol = args.tol if args.tol is not None else fc.size_tol(ing.mesh)
     if args.tol is None:
-        print(f"tolerance: {tol:.3f} mm  (relative: 0.1% of the "
+        print(f"tolerance: {tol:.3f} mm  (max of a 0.10 mm floor and 0.15% of the "
               f"{fc.bbox_diagonal(ing.mesh):.1f} mm bbox diagonal)")
 
     # feature-completeness: deviation can't see small features, so check that the
@@ -1582,7 +1582,8 @@ def main(argv=None) -> int:
                         "deviation: axis,cu,cv,t0,t1,r0,r1 (repeatable; use "
                         "after `probe thread` confirms a spec)")
     r.add_argument("--tol", type=float, default=None,
-                   help="deviation tolerance mm (default: 0.1%% of bbox diagonal)")
+                   help="deviation tolerance mm (default: max of 0.10mm and "
+                        "0.15%% of bbox diagonal)")
     r.add_argument("--out", default=None, help="export STEP here if it builds")
     r.set_defaults(fn=_cli_run)
 
