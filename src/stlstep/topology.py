@@ -137,9 +137,17 @@ def merge_region_on_surface(mesh, region, surf, u_p, v_p):
             tri_faces.append(fc)
     if len(tri_faces) < 0.5 * len(region.face_ids):
         return None
-    sewn = ou.sew_faces(tri_faces, tol=1e-3)
-    merged = ou.unify_same_domain(sewn, tol=1e-2)
-    return merged if face_matches_region(mesh, region, merged) else None
+    # OCCT can throw on a degenerate sew/merge (e.g. a NURBS drape of a tight
+    # freeform patch: ShapeUpgrade raises `BRep_API: command not done`). A region
+    # that won't merge analytically must fall back to faceting (step 4 in the
+    # caller), never crash the whole conversion — so swallow it into a clean None.
+    try:
+        sewn = ou.sew_faces(tri_faces, tol=1e-3)
+        merged = ou.unify_same_domain(sewn, tol=1e-2)
+        ok = face_matches_region(mesh, region, merged)
+    except Exception:  # noqa: BLE001 — any OCCT merge failure -> facet fallback
+        return None
+    return merged if ok else None
 
 
 def face_matches_region(mesh, region, shape) -> bool:
