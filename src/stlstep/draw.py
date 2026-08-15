@@ -997,18 +997,16 @@ def _emit_loop_lines(segs, mode_suffix, indent):
     return L
 
 
-def profile2d_snippet(mesh, axis, coord, height=None):
-    """Fit the cross-section ⟂ `axis` at `coord` to straight facets + fillet arcs
-    and emit a paste-ready build123d extrude snippet. Shared by `probe profile2d`
-    and `compose emit`. Returns ``(snippet, summary)`` or ``(None, [])`` if no loop
-    fits. `height` defaults to the full axial extent (sketch on the axis-min cap so
-    the extrude lands over the real part); pass an explicit height to sketch at the
-    station instead."""
-    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
-    polys = _section_polys(mesh, axis, coord)
+def _profile2d_body(mesh, axis, section_coord, sketch_base, height, indent=4):
+    """Fit the cross-section ⟂ `axis` at `section_coord` and emit the
+    BuildSketch(at `sketch_base`) + loops + extrude(`height`) body lines at
+    `indent` (no `from build123d` / `with BuildPart` wrapper). Decoupling the
+    section to fit from the plane to sketch on is what lets a stepped base fit each
+    band's true section while stacking the extrudes correctly. Returns
+    ``(lines, summary)`` or ``(None, [])``."""
+    polys = _section_polys(mesh, axis, section_coord)
     if not polys:
         return None, []
-    h = height if height is not None else (hi - lo)
     fitted, summary = [], []
     for exterior, interiors in polys:
         outer = fit_loop(exterior, arcs=True)
@@ -1034,22 +1032,66 @@ def profile2d_snippet(mesh, axis, coord, height=None):
                             "circle_r": [round(r, 2) for r in tc]})
     if not fitted:
         return None, []
-    plane = _PLANE[axis]
-    sg = _PSIGN[axis]
-    base = lo if height is None else coord
-    L = ["from build123d import *", "",
-         f"# extruded profile: {'xyz'[axis]}-section at {coord:.3f}, "
-         f"height {h:.3f} mm from {'xyz'[axis]}={base:.3f}  (facets + fillet arcs)",
-         "with BuildPart() as part:",
-         f"    with BuildSketch(Plane.{plane}.offset({_fmt(sg * base)})):"]
+    plane = _PLANE[axis]; sg = _PSIGN[axis]; pad = " " * indent
+    L = [f"{pad}with BuildSketch(Plane.{plane}.offset({_fmt(sg * sketch_base)})):"]
     for outer, holes in fitted:
-        L.append("        # facet/fillet profile")
-        L.extend(_emit_loop_lines(outer, "", 8))
+        L.append(f"{pad}    # facet/fillet profile")
+        L.extend(_emit_loop_lines(outer, "", indent + 4))
         for hl in holes:
-            L.append("        # hole")
-            L.extend(_emit_loop_lines(hl, ", mode=Mode.SUBTRACT", 8))
-    L.append(f"    extrude(amount={_fmt(sg * h)})")
-    return "\n".join(L), summary
+            L.append(f"{pad}    # hole")
+            L.extend(_emit_loop_lines(hl, ", mode=Mode.SUBTRACT", indent + 4))
+    L.append(f"{pad}extrude(amount={_fmt(sg * height)})")
+    return L, summary
+
+
+def profile2d_snippet(mesh, axis, coord, height=None):
+    """Fit the cross-section ⟂ `axis` at `coord` to straight facets + fillet arcs
+    and emit a paste-ready build123d extrude snippet. Shared by `probe profile2d`
+    and `compose emit`. Returns ``(snippet, summary)`` or ``(None, [])`` if no loop
+    fits. `height` defaults to the full axial extent (sketch on the axis-min cap so
+    the extrude lands over the real part); pass an explicit height to sketch at the
+    station instead."""
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    h = height if height is not None else (hi - lo)
+    base = lo if height is None else coord
+    body, summary = _profile2d_body(mesh, axis, coord, base, h)
+    if body is None:
+        return None, []
+    header = ["from build123d import *", "",
+              f"# extruded profile: {'xyz'[axis]}-section at {coord:.3f}, "
+              f"height {h:.3f} mm from {'xyz'[axis]}={base:.3f}  (facets + fillet "
+              f"arcs)", "with BuildPart() as part:"]
+    return "\n".join(header + body), summary
+
+
+def profile2d_stepped(mesh, axis, level_bounds, *, min_band=0.3):
+    """Emit a STEPPED base: one BuildPart with a sketch+extrude per level band, so
+    a part whose cross-section VARIES along the prismatic axis is captured band by
+    band instead of one section extruded full-length (which over/under-fills the
+    waist). `level_bounds` is the ascending list of band boundaries along `axis`
+    (from the prismatic recognizer). Each band fits its MIDPOINT section, sketches
+    at the band's lower face, and extrudes the band height. Returns
+    ``(snippet, summary)`` or ``(None, [])`` if no band fits."""
+    bounds = sorted(float(b) for b in level_bounds)
+    header = ["from build123d import *", "",
+              f"# stepped base: {len(bounds) - 1} level band(s) along "
+              f"{'xyz'[axis]}  (each band its own fitted section)",
+              "with BuildPart() as part:"]
+    body, summary = [], []
+    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+        h = b1 - b0
+        if h < min_band:
+            continue
+        mid = 0.5 * (b0 + b1)
+        lines, s = _profile2d_body(mesh, axis, mid, b0, h)
+        if lines is None:
+            continue
+        body.append(f"    # band {'xyz'[axis]}={b0:.2f}..{b1:.2f}")
+        body.extend(lines)
+        summary += s
+    if not body:
+        return None, []
+    return "\n".join(header + body), summary
 
 
 def _emit_script(ext, loops):

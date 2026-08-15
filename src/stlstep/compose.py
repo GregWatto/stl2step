@@ -135,8 +135,31 @@ def detect_edge_treatments(mesh, seg, neighbors) -> dict:
         [int(f) for f in np.where(oblique)[0]
          if int(f) not in analytic and int(f) not in fillet_faces], neighbors)
         if len(b) >= 6]
+    # locate each chamfer band (not just count it) so the composer knows WHERE to
+    # add a chamfer, not only how many exist. center = band vertex centroid; width
+    # = the strip's cross dimension (middle PCA extent — length is largest, ~0 is
+    # thickness); normal = mean oblique face normal (the cut plane's facing).
+    chamfers = []
+    for band in chamfer_bands:
+        vids = np.unique(F[np.asarray(band, int)].ravel())
+        pts = V[vids]
+        c = pts.mean(axis=0)
+        try:
+            ext = np.sort(np.linalg.svd(pts - c, compute_uv=False))
+            # singular values ~ sqrt(N)*extent; normalise to a length scale
+            scale = np.sqrt(max(len(pts), 1))
+            width = float(ext[1] / scale) if len(ext) >= 2 else 0.0
+        except Exception:  # noqa: BLE001
+            width = 0.0
+        nrm = fn[np.asarray(band, int)].mean(axis=0)
+        nrm = nrm / (np.linalg.norm(nrm) or 1.0)
+        chamfers.append({"center_mm": [round(float(x), 2) for x in c],
+                         "width_mm": round(width, 2),
+                         "normal": [round(float(x), 3) for x in nrm],
+                         "faces": int(len(band))})
     return {"fillets": _cluster_radii(radii),
-            "chamfers": ([{"count": len(chamfer_bands)}] if chamfer_bands else [])}
+            "chamfers": ([{"count": len(chamfer_bands),
+                           "bands": chamfers}] if chamfer_bands else [])}
 
 
 def _cluster_radii(radii: list[float]) -> list[dict]:
@@ -867,6 +890,30 @@ def _base_solid_along(base_mesh, p, ax) -> bool:
         return False
 
 
+def _scaffold_ok(script: str, ref_faces: int) -> bool:
+    """Exec a scaffold and check it's a CLEAN candidate: watertight (tested the
+    same way verify/diff does — STEP round-trip + fixed-tolerance tessellation, so
+    band-interface slivers are caught) AND parsimonious (B-Rep face count not a
+    'triangle soup', i.e. brep_faces <= 0.25*ref_faces, the diff's soup threshold).
+    Used to accept the stepped base only when it beats those bars; else the caller
+    falls back to the single-station base. False on any failure."""
+    import tempfile
+    from build123d import export_step, import_step, export_stl
+    try:
+        part = exec_script(script)
+        st = tempfile.NamedTemporaryFile(suffix=".step", delete=False); st.close()
+        export_step(part, st.name)
+        reimported = import_step(st.name)
+        sl = tempfile.NamedTemporaryFile(suffix=".stl", delete=False); sl.close()
+        export_stl(reimported, sl.name, tolerance=0.05, angular_tolerance=0.2)
+        if not trimesh.load(sl.name, force="mesh").is_watertight:
+            return False
+        n_faces = len(reimported.faces())
+        return n_faces <= 0.25 * max(1, ref_faces)
+    except Exception:  # noqa: BLE001 — any failure -> don't trust the stepped base
+        return False
+
+
 def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
     """Deterministic feature -> build123d scaffold: the reliable, fully-specified
     part of the model, emitted as a clean editable feature tree so the LLM starts
@@ -893,145 +940,204 @@ def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
     feats = analysis.get("features", {})
 
     # 1. base outer form = max cross-section station
+    def _snip_volume(snip):
+        if not snip:
+            return 0.0
+        try:
+            return abs(float(exec_script(snip).volume))
+        except Exception:  # noqa: BLE001 — an uncompilable base loses the scan
+            return 0.0
+
+    # single-station base: the station with the LARGEST cross-section (outer
+    # envelope before top-face pockets/chamfers shrink it)
     best_v, base = -1.0, ""
     for frac in (0.12, 0.25, 0.4, 0.55, 0.7, 0.85):
-        station = lo[ai] + frac * span
-        snip, _ = draw.profile2d_snippet(mesh, ai, float(station))
-        if not snip:
-            continue
-        try:
-            v = abs(float(exec_script(snip).volume))
-        except Exception:  # noqa: BLE001 — a bad station just loses the scan
-            v = 0.0
+        snip, _ = draw.profile2d_snippet(mesh, ai, float(lo[ai] + frac * span))
+        v = _snip_volume(snip)
         if v > best_v:
             best_v, base = v, snip
+
     if not base:
         raise ValueError("profile2d produced no base snippet for any station")
+    single_base = base
 
-    # base solid -> mesh, so open-bores can be gated on base solidity
-    base_mesh = None
-    try:
-        import tempfile
-        tf = tempfile.NamedTemporaryFile(suffix=".stl", delete=False); tf.close()
-        export_stl(exec_script(base), tf.name)
-        base_mesh = trimesh.load(tf.name)
-    except Exception:  # noqa: BLE001 — guard is best-effort
+    def _emit_features(base_snip, stepped):
+        """Emit the full scaffold (base + gated features) for a given base."""
         base_mesh = None
-
-    extrude_axis = np.zeros(3); extrude_axis[ai] = 1.0
-    lines = [base, "", "    # === auto-emitted features from analysis ===",
-             "    # holes: exact position + axis + diameter (all axes)"]
-    nh = 0; nct = 0; skipped = []
-    for h in feats.get("holes", []):
-        dia = float(h["diameter_mm"]); ax = h["axis"]
-        L = diag * 1.2 if h.get("through") else float(h.get("depth_mm") or diag)
-        cut_positions = []
-        for p in h["positions_mm"]:
-            if h.get("source") == "open-bore":
-                parallel = abs(float(np.dot(np.asarray(ax, float),
-                                            extrude_axis))) > 0.9
-                if not (parallel and _base_solid_along(base_mesh, p, ax)):
-                    why = ("axis ⟂ extrude — base can't hold it" if not parallel
-                           else "base silhouette already has it")
-                    skipped.append(
-                        f"    #   OPEN-BORE Ø{dia:.2f} at "
-                        f"{tuple(round(x, 2) for x in p)} axis {ax} — {why}; "
-                        f"LLM to verify/place")
+        try:
+            import tempfile
+            tf = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
+            tf.close()
+            export_stl(exec_script(base_snip), tf.name)
+            base_mesh = trimesh.load(tf.name)
+        except Exception:  # noqa: BLE001 — solidity guard is best-effort
+            base_mesh = None
+        extrude_axis = np.zeros(3); extrude_axis[ai] = 1.0
+        base_kind = "stepped" if stepped else "single-station"
+        lines = [base_snip, "",
+                 f"    # === auto-emitted features ({base_kind} base) ===",
+                 "    # holes: exact position + axis + diameter (all axes)"]
+        nh = nct = nb = npk = 0; skipped = []
+        for h in feats.get("holes", []):
+            dia = float(h["diameter_mm"]); ax = h["axis"]
+            L = diag * 1.2 if h.get("through") else float(h.get("depth_mm") or diag)
+            cut_positions = []
+            for p in h["positions_mm"]:
+                if h.get("source") == "open-bore":
+                    # open-bore: straight-cut only PARALLEL bores the base lacks
+                    # (avoids straight-cutting a curved duct)
+                    parallel = abs(float(np.dot(np.asarray(ax, float),
+                                                extrude_axis))) > 0.9
+                    if not (parallel and _base_solid_along(base_mesh, p, ax)):
+                        why = ("axis ⟂ extrude — base can't hold it"
+                               if not parallel else "base already has it")
+                        skipped.append(
+                            f"    #   OPEN-BORE Ø{dia:.2f} at "
+                            f"{tuple(round(x, 2) for x in p)} axis {ax} — {why}; "
+                            f"LLM to verify/place")
+                        continue
+                elif stepped and not _base_solid_along(base_mesh, p, ax):
+                    # a stepped base already carries every section-visible feature;
+                    # carve only holes the bands genuinely miss (e.g. ⟂ holes).
+                    # Re-cutting a section-captured hole double-removes / conflicts.
                     continue
-            lines.append(
-                f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
-                f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}))):")
-            lines.append(f"        Cylinder(radius={dia / 2:.4f}, height={L:.4f}, "
-                         f"mode=Mode.SUBTRACT)")
-            nh += 1
-            cut_positions.append(p)
-        # counterbore / countersink at the mouths — at EVERY cut instance of the
-        # pattern (the treatment is measured once but applies to all like holes)
-        axv = np.asarray(ax, float); ai_h = int(np.argmax(np.abs(axv)))
-        into = np.sign(axv[ai_h]) if axv[ai_h] else 1.0
-        for t in h.get("end_treatments", []):
-            major = t["major_dia_mm"]; dep = t["depth_mm"]
-            zd = [0.0, 0.0, 0.0]
-            zd[ai_h] = float(into) if t["end"] == "lo" else -float(into)
-            for p in cut_positions:
-                o = list(p); o[ai_h] = t["face_mm"]
                 lines.append(
-                    f"    with Locations(Plane(origin=({o[0]:.4f}, {o[1]:.4f}, "
-                    f"{o[2]:.4f}), z_dir=({zd[0]:.1f}, {zd[1]:.1f}, "
-                    f"{zd[2]:.1f}))):")
-                if t["kind"] == "counterbore":
+                    f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
+                    f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, "
+                    f"{ax[2]:.4f}))):")
+                lines.append(f"        Cylinder(radius={dia / 2:.4f}, "
+                             f"height={L:.4f}, mode=Mode.SUBTRACT)")
+                nh += 1
+                cut_positions.append(p)
+            # counterbore / countersink at the mouths — a sub-band face feature the
+            # stepped base never captures, so emit at EVERY instance even when the
+            # through-cut was gated out. Skip open-bores (channels, no screw mouth).
+            treat_positions = (h["positions_mm"]
+                               if h.get("source") != "open-bore" else cut_positions)
+            axv = np.asarray(ax, float); ai_h = int(np.argmax(np.abs(axv)))
+            into = np.sign(axv[ai_h]) if axv[ai_h] else 1.0
+            for t in h.get("end_treatments", []):
+                major = t["major_dia_mm"]; dep = t["depth_mm"]
+                zd = [0.0, 0.0, 0.0]
+                zd[ai_h] = float(into) if t["end"] == "lo" else -float(into)
+                for p in treat_positions:
+                    o = list(p); o[ai_h] = t["face_mm"]
                     lines.append(
-                        f"        Cylinder(radius={major / 2:.4f}, "
-                        f"height={dep:.4f}, align=(Align.CENTER, Align.CENTER, "
-                        f"Align.MIN), mode=Mode.SUBTRACT)  # counterbore")
-                else:  # countersink: cone, wide at the face -> nominal at depth
-                    lines.append(
-                        f"        Cone(bottom_radius={major / 2:.4f}, "
-                        f"top_radius={dia / 2:.4f}, height={dep:.4f}, "
-                        f"align=(Align.CENTER, Align.CENTER, Align.MIN), "
-                        f"mode=Mode.SUBTRACT)  # countersink")
-                nct += 1
-    if skipped:
-        lines.append("    # recovered open-bores NOT auto-cut (left for the LLM):")
-        lines += skipped
+                        f"    with Locations(Plane(origin=({o[0]:.4f}, {o[1]:.4f}, "
+                        f"{o[2]:.4f}), z_dir=({zd[0]:.1f}, {zd[1]:.1f}, "
+                        f"{zd[2]:.1f}))):")
+                    if t["kind"] == "counterbore":
+                        lines.append(
+                            f"        Cylinder(radius={major / 2:.4f}, "
+                            f"height={dep:.4f}, align=(Align.CENTER, Align.CENTER, "
+                            f"Align.MIN), mode=Mode.SUBTRACT)  # counterbore")
+                    else:
+                        # countersink: cone WIDE at the face tapering to a near-
+                        # point INTO the hole void. Stopping at the hole radius
+                        # leaves a zero-thickness tangent sliver (non-watertight);
+                        # running the cone transversally through the wall to a point
+                        # keeps the solid watertight.
+                        slope = max((major - dia) / 2 / max(dep, 0.05), 0.1)
+                        csk_h = (major / 2) / slope
+                        lines.append(
+                            f"        Cone(bottom_radius={major / 2:.4f}, "
+                            f"top_radius=0.01, height={csk_h:.4f}, "
+                            f"align=(Align.CENTER, Align.CENTER, Align.MIN), "
+                            f"mode=Mode.SUBTRACT)  # countersink (~45deg)")
+                    nct += 1
+        if skipped:
+            lines.append("    # recovered open-bores NOT auto-cut (LLM to place):")
+            lines += skipped
 
-    nb = 0
-    for b in feats.get("bosses", []):
-        dia = float(b.get("diameter_mm", 0)); ax = b.get("axis", [0, 0, 1])
-        L = float(b.get("height_mm") or b.get("depth_mm") or 1)
-        for p in b.get("positions_mm", []):
+        for b in feats.get("bosses", []):
+            dia = float(b.get("diameter_mm", 0)); ax = b.get("axis", [0, 0, 1])
+            L = float(b.get("height_mm") or b.get("depth_mm") or 1)
+            for p in b.get("positions_mm", []):
+                # stepped base already carries section-visible bosses
+                if stepped and _base_solid_along(base_mesh, p, ax):
+                    continue
+                lines.append(
+                    f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
+                    f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, "
+                    f"{ax[2]:.4f}))):")
+                lines.append(f"        Cylinder(radius={dia / 2:.4f}, "
+                             f"height={L:.4f}, mode=Mode.ADD)")
+                nb += 1
+
+        if feats.get("pockets"):
+            lines.append("    # pockets: centre + size + depth on the opening face")
+        for p in feats.get("pockets", []):
+            c = p.get("center_mm")
+            if not c:
+                continue
+            n = p["opening_normal"]; w, ht = p["size_mm"]
+            depth = float(p["depth_mm"])
+            # stepped base already carries a section-visible pocket
+            if stepped and not _base_solid_along(base_mesh, c, n):
+                continue
+            ax = p.get("plane_axes")
+            xdir = (f", x_dir=({ax[0][0]:.4f}, {ax[0][1]:.4f}, {ax[0][2]:.4f})"
+                    if ax else "")
             lines.append(
-                f"    with Locations(Plane(origin=({p[0]:.4f}, {p[1]:.4f}, "
-                f"{p[2]:.4f}), z_dir=({ax[0]:.4f}, {ax[1]:.4f}, {ax[2]:.4f}))):")
-            lines.append(f"        Cylinder(radius={dia / 2:.4f}, height={L:.4f}, "
-                         f"mode=Mode.ADD)")
-            nb += 1
+                f"    with Locations(Plane(origin=({c[0]:.4f}, {c[1]:.4f}, "
+                f"{c[2]:.4f}){xdir}, z_dir=({n[0]:.4f}, {n[1]:.4f}, "
+                f"{n[2]:.4f}))):")
+            lines.append(f"        Box({w:.4f}, {ht:.4f}, {depth + 2:.4f}, "
+                         f"mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, "
+                         f"Align.MIN))")
+            npk += 1
 
-    npk = 0
-    if feats.get("pockets"):
-        lines.append("    # pockets: centre + size + depth on the opening face")
-    for p in feats.get("pockets", []):
-        c = p.get("center_mm")
-        if not c:
-            continue
-        n = p["opening_normal"]; w, ht = p["size_mm"]; depth = float(p["depth_mm"])
-        ax = p.get("plane_axes")
-        xdir = (f", x_dir=({ax[0][0]:.4f}, {ax[0][1]:.4f}, {ax[0][2]:.4f})"
-                if ax else "")
-        lines.append(f"    with Locations(Plane(origin=({c[0]:.4f}, {c[1]:.4f}, "
-                     f"{c[2]:.4f}){xdir}, z_dir=({n[0]:.4f}, {n[1]:.4f}, "
-                     f"{n[2]:.4f}))):")
-        lines.append(f"        Box({w:.4f}, {ht:.4f}, {depth + 2:.4f}, "
-                     f"mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, "
-                     f"Align.MIN))")
-        npk += 1
+        # what the analysis still can't place precisely — the LLM's remaining job
+        todo = []
+        for p in feats.get("pockets", []):
+            if not p.get("center_mm"):
+                todo.append(f"#   POCKET {p['size_mm']} depth {p['depth_mm']} "
+                            f"normal {p['opening_normal']} — no centre; from a "
+                            f"section")
+        for note in feats.get("notes", []):
+            if "SADDLE" in note:
+                todo.append("#   " + note)
+        et = analysis.get("edge_treatments", {})
+        for f in et.get("fillets", []):
+            todo.append(f"#   FILLET r={f.get('radius_mm')} x{f.get('count')} — "
+                        f"locations not detected; add on the relevant edges")
+        for c in et.get("chamfers", []):
+            bands = c.get("bands") or []
+            if bands:
+                todo.append(f"#   CHAMFER x{c.get('count')} — locations below; add "
+                            f"chamfer() on the edge nearest each centre:")
+                for bd in bands:
+                    todo.append(f"#     at {tuple(bd['center_mm'])} ~{bd['width_mm']}"
+                                f"mm wide, cut-face normal {tuple(bd['normal'])}")
+            else:
+                todo.append(f"#   CHAMFER x{c.get('count')} — locations not detected; "
+                            f"add on the relevant edges")
+        if todo:
+            lines.append("")
+            lines.append("    # === TODO (underspecified — LLM to place, measure "
+                         "with probe) ===")
+            lines += ["    " + t for t in todo]
 
-    # what the analysis still can't place precisely — the LLM's remaining job
-    todo = []
-    for p in feats.get("pockets", []):
-        if not p.get("center_mm"):
-            todo.append(f"#   POCKET {p['size_mm']} depth {p['depth_mm']} normal "
-                        f"{p['opening_normal']} — no centre; place from a section")
-    for note in feats.get("notes", []):
-        if "SADDLE" in note:
-            todo.append("#   " + note)
-    et = analysis.get("edge_treatments", {})
-    for f in et.get("fillets", []):
-        todo.append(f"#   FILLET r={f.get('radius_mm')} x{f.get('count')} — "
-                    f"locations not detected; add on the relevant edges")
-    for c in et.get("chamfers", []):
-        todo.append(f"#   CHAMFER x{c.get('count')} — locations not detected; "
-                    f"add on the relevant edges")
-    if todo:
-        lines.append("")
-        lines.append("    # === TODO (underspecified — LLM to place, measure with "
-                     "probe) ===")
-        lines += ["    " + t for t in todo]
+        stats = {"holes": nh, "counterbores": nct, "bosses": nb, "pockets": npk,
+                 "skipped_bores": len(skipped), "todos": len(todo),
+                 "base": base_kind}
+        return "\n".join(lines) + "\n", stats
 
-    stats = {"holes": nh, "counterbores": nct, "bosses": nb, "pockets": npk,
-             "skipped_bores": len(skipped), "todos": len(todo),
-             "base_station_volume_mm3": round(best_v, 1)}
-    return "\n".join(lines) + "\n", stats
+    # Prefer a STEPPED base (fits each level band's own section — far better on
+    # parts whose section varies along the axis), but keep it ONLY if the full
+    # scaffold stays watertight: feature cuts across band interfaces can leave
+    # slivers, and a non-watertight scaffold is invalid. Otherwise fall back to
+    # the single-station base (never a regression vs. the old behaviour).
+    level_bounds = (analysis["deterministic_recognizers"].get("prismatic")
+                    or {}).get("level_bounds")
+    if level_bounds and len(level_bounds) >= 3:
+        step_snip, _ = draw.profile2d_stepped(mesh, ai, level_bounds)
+        step_v = _snip_volume(step_snip)
+        if step_snip and step_v > 0 and (best_v <= 0 or step_v < 3.0 * best_v):
+            script, stats = _emit_features(step_snip, True)
+            if _scaffold_ok(script, len(mesh.faces)):
+                return script, stats
+    return _emit_features(single_base, False)
 
 
 def _cli_emit(args) -> int:
