@@ -1128,12 +1128,25 @@ def build_scaffold(mesh: trimesh.Trimesh, analysis: dict) -> tuple[str, dict]:
     # scaffold stays watertight: feature cuts across band interfaces can leave
     # slivers, and a non-watertight scaffold is invalid. Otherwise fall back to
     # the single-station base (never a regression vs. the old behaviour).
+    #
+    # Try coalesce tolerances TIGHT-FIRST: a low tolerance keeps each band's own
+    # section (most accurate), so accept the first that clears the gate. Escalating
+    # to a looser tolerance MERGES near-identical bands, which removes the band
+    # interfaces where feature cuts sliver (restoring watertightness) and trims the
+    # face count that trips the parsimony bar — unlocking a stepped base on parts a
+    # single tolerance couldn't (e.g. x-carriage: 7 bands non-watertight -> 4 bands
+    # watertight). The gate is the accuracy safety net: an over-merged base that no
+    # longer matches the part fails watertight/parsimony and is rejected.
     level_bounds = (analysis["deterministic_recognizers"].get("prismatic")
                     or {}).get("level_bounds")
     if level_bounds and len(level_bounds) >= 3:
-        step_snip, _ = draw.profile2d_stepped(mesh, ai, level_bounds)
-        step_v = _snip_volume(step_snip)
-        if step_snip and step_v > 0 and (best_v <= 0 or step_v < 3.0 * best_v):
+        for ctol in (0.02, 0.15, 0.35):
+            step_snip, _ = draw.profile2d_stepped(
+                mesh, ai, level_bounds, coalesce_tol=ctol)
+            step_v = _snip_volume(step_snip)
+            if not (step_snip and step_v > 0
+                    and (best_v <= 0 or step_v < 3.0 * best_v)):
+                continue
             script, stats = _emit_features(step_snip, True)
             if _scaffold_ok(script, len(mesh.faces)):
                 return script, stats

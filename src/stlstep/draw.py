@@ -1064,21 +1064,78 @@ def profile2d_snippet(mesh, axis, coord, height=None):
     return "\n".join(header + body), summary
 
 
-def profile2d_stepped(mesh, axis, level_bounds, *, min_band=0.3):
+def _band_section_shape(mesh, axis, coord):
+    """Shapely geometry of the cross-section at `coord` (exteriors minus holes,
+    unioned across disjoint islands). Used to decide whether two consecutive
+    stepped-base bands are the same shape and can be coalesced. None if the plane
+    misses the mesh or no valid polygon builds."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    polys = _section_polys(mesh, axis, coord)
+    if not polys:
+        return None
+    geoms = []
+    for ext, holes in polys:
+        try:
+            p = Polygon(ext, holes)
+            if not p.is_valid:
+                p = p.buffer(0)
+            if not p.is_empty:
+                geoms.append(p)
+        except Exception:  # noqa: BLE001 — a degenerate ring just isn't compared
+            continue
+    if not geoms:
+        return None
+    return unary_union(geoms)
+
+
+def _sections_similar(a, b, *, tol=0.02):
+    """True if two cross-section shapes match within `tol` — symmetric-difference
+    area as a fraction of the mean area. Both must be non-None. Used to merge
+    consecutive stepped-base bands that carry the same profile."""
+    if a is None or b is None:
+        return False
+    mean_area = 0.5 * (a.area + b.area)
+    if mean_area <= 0:
+        return False
+    try:
+        return (a.symmetric_difference(b).area / mean_area) <= tol
+    except Exception:  # noqa: BLE001 — comparison failure -> keep bands separate
+        return False
+
+
+def profile2d_stepped(mesh, axis, level_bounds, *, min_band=0.3, coalesce_tol=0.02):
     """Emit a STEPPED base: one BuildPart with a sketch+extrude per level band, so
     a part whose cross-section VARIES along the prismatic axis is captured band by
     band instead of one section extruded full-length (which over/under-fills the
     waist). `level_bounds` is the ascending list of band boundaries along `axis`
-    (from the prismatic recognizer). Each band fits its MIDPOINT section, sketches
-    at the band's lower face, and extrudes the band height. Returns
-    ``(snippet, summary)`` or ``(None, [])`` if no band fits."""
+    (from the prismatic recognizer). Each emitted band fits its MIDPOINT section,
+    sketches at the band's lower face, and extrudes the band height.
+
+    Consecutive bands whose cross-sections match within `coalesce_tol` are MERGED
+    into one taller band before emission. This cuts the emitted face count on parts
+    whose "levels" are really one prismatic run split by a stray cap — fewer faces
+    means the stepped base clears the watertight/parsimony gate on more parts.
+    Returns ``(snippet, summary)`` or ``(None, [])`` if no band fits."""
     bounds = sorted(float(b) for b in level_bounds)
-    header = ["from build123d import *", "",
-              f"# stepped base: {len(bounds) - 1} level band(s) along "
-              f"{'xyz'[axis]}  (each band its own fitted section)",
-              "with BuildPart() as part:"]
-    body, summary = [], []
-    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+    raw = list(zip(bounds[:-1], bounds[1:]))
+    if not raw:
+        return None, []
+
+    # Coalesce: walk consecutive bands, comparing each against the current group's
+    # ANCHOR section (not its neighbour) so a slow drift can't chain unlike bands.
+    shapes = [_band_section_shape(mesh, axis, 0.5 * (b0 + b1)) for b0, b1 in raw]
+    groups, i, n = [], 0, len(raw)
+    while i < n:
+        j = i
+        while (j + 1 < n
+               and _sections_similar(shapes[i], shapes[j + 1], tol=coalesce_tol)):
+            j += 1
+        groups.append((raw[i][0], raw[j][1]))
+        i = j + 1
+
+    body, summary, emitted = [], [], 0
+    for b0, b1 in groups:
         h = b1 - b0
         if h < min_band:
             continue
@@ -1089,8 +1146,15 @@ def profile2d_stepped(mesh, axis, level_bounds, *, min_band=0.3):
         body.append(f"    # band {'xyz'[axis]}={b0:.2f}..{b1:.2f}")
         body.extend(lines)
         summary += s
+        emitted += 1
     if not body:
         return None, []
+    coalesced = len(raw) - emitted
+    note = f"; coalesced {coalesced} of {len(raw)}" if coalesced > 0 else ""
+    header = ["from build123d import *", "",
+              f"# stepped base: {emitted} level band(s) along "
+              f"{'xyz'[axis]}{note}  (each band its own fitted section)",
+              "with BuildPart() as part:"]
     return "\n".join(header + body), summary
 
 
