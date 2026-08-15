@@ -105,12 +105,19 @@ def _pockets(mesh, seg, diag) -> list[dict]:
         if not (_is_void(mesh, fl["pts"], n, f + 0.5 * depth)
                 and _is_void(mesh, fl["pts"], n, opening - min(0.5, 0.2 * depth))):
             continue
+        # in-plane centre of the footprint, lifted to the floor level in 3D — so the pocket is
+        # PLACEABLE (a size without a centre can't be emitted). e1,e2 span the floor; n is depth.
+        cu, cv = 0.5 * (ub[0] + ub[1]), 0.5 * (vb[0] + vb[1])
+        centre = cu * e1 + cv * e2 + f * n
         out.append({"opening_normal": [round(float(x), 3) for x in n],
                     "opening_level_mm": round(opening, 2),
                     "floor_level_mm": round(float(f), 2),
                     "depth_mm": round(depth, 2),
                     "size_mm": [round(float(ub[1] - ub[0]), 1),
-                                round(float(vb[1] - vb[0]), 1)]})
+                                round(float(vb[1] - vb[0]), 1)],
+                    "center_mm": [round(float(x), 2) for x in centre],
+                    "plane_axes": [[round(float(x), 4) for x in e1],
+                                   [round(float(x), 4) for x in e2]]})
     return out
 
 
