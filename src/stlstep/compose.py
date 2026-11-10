@@ -27,6 +27,8 @@ in-session driver where the operator's own model composes (see compose_demo.py).
 
 from __future__ import annotations
 
+from .proximity import closest_point
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -53,6 +55,33 @@ def _r(x, n=3):
     if isinstance(x, (list, tuple, np.ndarray)):
         return [_r(v, n) for v in np.asarray(x).tolist()]
     return round(float(x), n)
+
+
+def _cylinder_support(mesh, face_ids, params):
+    """Independent normal evidence for a positional cylinder fit.
+
+    Polygon corners can lie on a circle even when the intervening faces are
+    flat facets. A cylinder's face normals must also point radially.
+    """
+    axis = np.array(params["axis"], dtype=float, copy=True)
+    axis /= np.linalg.norm(axis)
+    center = np.asarray(params["center_mm"], dtype=float)
+    radial = np.asarray(mesh.triangles_center[face_ids]) - center
+    radial -= (radial @ axis)[:, None] * axis
+    radial /= np.maximum(np.linalg.norm(radial, axis=1)[:, None], 1e-12)
+    agreement = np.abs(np.sum(radial * mesh.face_normals[face_ids], axis=1))
+    # Area weighting prevents tessellation density from creating confidence.
+    weights = np.asarray(mesh.area_faces[face_ids])
+    supported = float(weights[agreement >= np.cos(np.radians(10))].sum()
+                      / max(float(weights.sum()), 1e-12))
+    u = np.cross(axis, [1., 0, 0] if abs(axis[0]) < .9 else [0., 1, 0])
+    u /= np.linalg.norm(u)
+    v = np.cross(axis, u)
+    angles = np.sort(np.arctan2(radial @ v, radial @ u))
+    span = 360 - float(np.degrees(np.diff(np.r_[angles, angles[0] + 2*np.pi]).max()))
+    return {"normal_support_fraction": round(supported, 4),
+            "angular_span_deg": round(span, 2),
+            "confident": supported >= .95}
 
 
 def _cylinder_desc(mesh, region):
@@ -90,6 +119,7 @@ def _cylinder_desc(mesh, region):
         "end_a_mm": _r(end_lo),
         "end_b_mm": _r(end_hi),
         "area_mm2": _r(float(areas.sum()), 1),
+        "fit_support": _cylinder_support(mesh, ids, p),
     }
 
 
@@ -109,15 +139,15 @@ def detect_edge_treatments(mesh, seg, neighbors) -> dict:
         ang = np.degrees(np.asarray(mesh.face_adjacency_angles))
         conv = np.asarray(mesh.face_adjacency_convex)
         pairs = np.asarray(mesh.face_adjacency)
-    except Exception:  # noqa: BLE001 — non-manifold mesh: no adjacency angles
-        return {"fillets": [], "chamfers": []}
+    except Exception as exc:
+        raise RuntimeError("cannot analyze edge adjacency") from exc
     diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
     analytic = {int(f) for r in seg.regions if r.kind != "plane"
                 and r.kind != "freeform" for f in r.face_ids}
 
     rounded = (ang > 2) & (ang < 45) & conv
     fillet_faces = {int(f) for f in np.unique(pairs[rounded])}
-    radii = []
+    radii, uncertain = [], []
     for band in connected_components([f for f in fillet_faces if f not in analytic],
                                      neighbors):
         if len(band) < 10:
@@ -128,7 +158,12 @@ def detect_edge_treatments(mesh, seg, neighbors) -> dict:
         params, resid = fit
         r = float(params["radius_mm"])
         if 0.2 < r < 0.35 * diag and resid < 0.06 * r:   # tight resid = a real round
-            radii.append(r)
+            support = _cylinder_support(mesh, band, params)
+            if support["confident"] and support["angular_span_deg"] >= 30:
+                radii.append(r)
+            else:
+                uncertain.append({"radius_mm": _r(r), **support,
+                                  "note": "insufficient cylindrical normal/turn evidence; inspect sections"})
 
     oblique = np.abs(fn).max(axis=1) < 0.94
     chamfer_bands = [b for b in connected_components(
@@ -158,6 +193,7 @@ def detect_edge_treatments(mesh, seg, neighbors) -> dict:
                          "normal": [round(float(x), 3) for x in nrm],
                          "faces": int(len(band))})
     return {"fillets": _cluster_radii(radii),
+            "low_confidence_fillets": uncertain,
             "chamfers": ([{"count": len(chamfer_bands),
                            "bands": chamfers}] if chamfer_bands else [])}
 
@@ -235,17 +271,11 @@ def analyze(mesh: trimesh.Trimesh) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
-    try:
-        edge_treatments = detect_edge_treatments(mesh, seg, neighbors)
-    except Exception:  # noqa: BLE001 — a hint; never fatal
-        edge_treatments = {"fillets": [], "chamfers": []}
+    edge_treatments = detect_edge_treatments(mesh, seg, neighbors)
 
     lo, hi = mesh.bounds
-    try:
-        from .features import group_features
-        features = group_features(mesh, seg, surfaces, (hi - lo).tolist())
-    except Exception:  # noqa: BLE001 — grouping is a convenience; never fatal
-        features = None
+    from .features import group_features
+    features = group_features(mesh, seg, surfaces, (hi - lo).tolist())
 
     return {
         "units": "mm",
@@ -563,8 +593,8 @@ def run_candidate(script: str, mesh: trimesh.Trimesh, workdir: str,
         excl_fwd = int((~keep).sum()); pts = pts[keep]
         keep = fc.mask_points_in_bands(gpts, exclude_bands)
         excl_rev = int((~keep).sum()); gpts = gpts[keep]
-    _, fwd, _ = trimesh.proximity.closest_point(gen, pts)
-    _, rev, _ = trimesh.proximity.closest_point(mesh, gpts)
+    _, fwd, _ = closest_point(gen, pts)
+    _, rev, _ = closest_point(mesh, gpts)
 
     cand = Candidate(
         ok=True, script=script, part=part,
@@ -1268,6 +1298,9 @@ def _cli_brief(args) -> int:
     if feats.get("low_confidence_fits"):
         print(f"  low-confidence fits (distrust): {feats['low_confidence_fits']}")
     et = a.get("edge_treatments", {})
+    if et.get("low_confidence_fillets"):
+        print(f"  low-confidence fillet hints (confirm vs sections): "
+              f"{et['low_confidence_fillets']}")
     if et.get("fillets") or et.get("chamfers"):
         fil = ", ".join(f"r~{f['radius_mm']}mm x{f['count']}"
                         for f in et.get("fillets", []))
@@ -1306,13 +1339,17 @@ def _cli_run(args) -> int:
     # after a `probe thread` identification). A nominal hole/stud legitimately
     # deviates from the mesh helix inside these; exclude, don't punish.
     analysis = None
+    validation_errors = []
     apath = os.path.join(args.workdir, "analysis.json")
     if os.path.exists(apath):
         try:
             with open(apath) as fp:
                 analysis = json.load(fp)
-        except Exception:  # noqa: BLE001
-            analysis = None
+        except Exception as exc:  # report invalid analysis; never skip its gate
+            validation_errors.append(f"analysis: {type(exc).__name__}: {exc}")
+    if not isinstance(analysis, dict) or not isinstance(analysis.get("features"), dict):
+        validation_errors.append("analysis: missing feature analysis; run `brief` first")
+        analysis = None
     bands = fc.thread_bands(analysis) if analysis else []
     for spec in (args.thread_band or []):
         try:
@@ -1345,6 +1382,8 @@ def _cli_run(args) -> int:
         if analysis is not None:
             try:
                 gaps = fc.feature_gap(analysis, cand.part.wrapped)
+                if not isinstance(gaps, list):
+                    raise ValueError("feature check returned no result list")
                 if bands:
                     # helix flanks masquerade as fillet bands in the detector;
                     # with threads recognized, fillet demands become advisory
@@ -1356,11 +1395,10 @@ def _cli_run(args) -> int:
                 print(fc.format_gap(gaps))
                 hard_gap = any(g["found"] is not None and g["found"] < g["expected"]
                                for g in gaps)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # validation failures must be visible
+                validation_errors.append(f"feature check: {type(exc).__name__}: {exc}")
         else:
-            print("feature check: skipped (run `brief` first to write "
-                  "analysis.json for feature-completeness checking)")
+            print("feature check: unavailable (run `brief` first)")
 
     # slice-occupancy: the volumetric-truth check. Surface distance measures how
     # close the skins are; this slices BOTH solids along all three axes and
@@ -1372,10 +1410,17 @@ def _cli_run(args) -> int:
     occ_gap = False
     if cand.ok:
         try:
-            from . import occ_util as ou
-            rv, rf = ou.shape_to_mesh(cand.part.wrapped, 0.1)
-            cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+            cg = fc.CADSections(cand.part)
             occ = fc.slice_occupancy(ing.mesh, cg, exclude_bands=bands or None)
+            axes = occ.get("per_axis", []) if isinstance(occ, dict) else []
+            if ({a["axis"] for a in axes} != set("xyz") or
+                    any(a.get("mean_iou") is None or not a.get("coords") for a in axes)):
+                raise ValueError("occupancy did not measure all three axes")
+            if not all(np.isfinite(occ[k]) for k in
+                       ("mean_iou", "missing_frac", "extra_frac", "void_missing_frac")):
+                raise ValueError("occupancy returned non-finite metrics")
+            if not isinstance(occ.get("loop_mismatches"), list):
+                raise ValueError("opening check returned no mismatch list")
             if occ and occ.get("mean_iou") is not None:
                 print(f"slice occupancy (solid-vs-void, 3 axes): mean IoU "
                       f"{occ['mean_iou']}  |  MISSING material {occ['missing_mm3']}"
@@ -1414,12 +1459,14 @@ def _cli_run(args) -> int:
                           f"red=missing, blue=extra, per worst slice)")
                 occ_gap = (occ["missing_frac"] > 0.03 or occ["extra_frac"] > 0.03
                            or bool(occ.get("loop_mismatches")))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # validation failures must be visible
+            validation_errors.append(f"occupancy check: {type(exc).__name__}: {exc}")
 
+    for error in validation_errors:
+        print(f"VALIDATION ERROR: {error}")
     passed = bool(cand.ok and cand.valid and cand.closed and
                   cand.deviation_mm <= tol and cand.reverse_max_mm <= tol and
-                  not hard_gap and not occ_gap)
+                  not hard_gap and not occ_gap and not validation_errors)
     if cand.ok:
         print(f"colormaps: MISSING={cand.colormap_fwd_png}  "
               f"EXTRA={cand.colormap_png}   <- Read these images")
@@ -1431,6 +1478,7 @@ def _cli_run(args) -> int:
                        "closed": cand.closed, "passed": passed,
                        "tolerance_mm": round(tol, 4),
                        "feature_gaps": gaps,
+                       "validation_errors": validation_errors,
                        "slice_occupancy": ({k: v for k, v in occ.items()
                                             if k != "per_axis"} if occ else None),
                        "metrics": cand.metrics}, fp, indent=2)
@@ -1443,7 +1491,7 @@ def _cli_run(args) -> int:
                 fp.write(script)
             print(f"exported {args.out}  +  {args.workdir}/feature_tree.py")
     if not passed and cand.ok:
-        why = []
+        why = list(validation_errors)
         if cand.deviation_mm > tol or cand.reverse_max_mm > tol:
             why.append(f"deviation {max(cand.deviation_mm, cand.reverse_max_mm):.3f}"
                        f" > {tol:.3f} mm")
@@ -1532,8 +1580,7 @@ def _cli_slices(args) -> int:
         print("CANDIDATE FAILED TO BUILD — nothing to compare:")
         print("".join(traceback.format_exception_only(type(e), e)).strip())
         return 1
-    rv, rf = ou.shape_to_mesh(part.wrapped, 0.1)
-    cg = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
+    cg = fc.CADSections(part)
 
     ai = {"x": 0, "y": 1, "z": 2}.get(args.axis)
     if ai is None:

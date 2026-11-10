@@ -17,6 +17,8 @@ Returning per-region provenance lets the gate attribute deviation to regions.
 
 from __future__ import annotations
 
+from .proximity import closest_point
+
 import numpy as np
 
 from . import occ_util as ou
@@ -181,10 +183,10 @@ def _region_deviation(mesh, region, merged_shape) -> float:
     reg = mesh.submesh([np.asarray(region.face_ids)], append=True)
 
     # mesh vertices -> generated surface
-    _, d1, _ = trimesh.proximity.closest_point(gen, reg.vertices)
+    _, d1, _ = closest_point(gen, reg.vertices)
     # generated-surface sample points -> mesh patch
     gpts, _ = trimesh.sample.sample_surface(gen, min(4000, 4 * len(gen.faces) + 10))
-    _, d2, _ = trimesh.proximity.closest_point(reg, np.asarray(gpts))
+    _, d2, _ = closest_point(reg, np.asarray(gpts))
     return max(float(np.quantile(d1, 0.98)), float(np.quantile(d2, 0.98)))
 
 

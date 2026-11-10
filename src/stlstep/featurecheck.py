@@ -97,9 +97,49 @@ def internal_void_gap(target_mesh, cand_mesh, *, axis=None, n=48) -> dict | None
 # agent needs in order to fix it.
 # ----------------------------------------------------------------------------
 
+class CADSections:
+    """Sections of the CAD solid, independent of its display tessellation seams."""
+    def __init__(self, part):
+        self.part = part
+        bbox = part.bounding_box()
+        self.bounds = np.array([tuple(bbox.min), tuple(bbox.max)], dtype=float)
+        self._cache = {}
+
+    def section_region(self, axis, coord):
+        from build123d import section, Plane
+        from shapely.geometry import Polygon
+        from shapely.ops import unary_union
+        from .occ_util import shape_to_mesh
+        key = (axis, float(coord))
+        if key in self._cache:
+            return self._cache[key]
+        uv = [a for a in range(3) if a != axis]
+        normal = np.eye(3)[axis]
+        plane = Plane(origin=tuple(normal*coord), x_dir=tuple(np.eye(3)[uv[0]]),
+                      z_dir=tuple(normal))
+        cut = section(self.part, section_by=plane)
+        if not cut.faces():
+            self._cache[key] = None
+            return None
+        vertices, faces = shape_to_mesh(cut.wrapped, .01, .1)
+        if len(faces) == 0:
+            raise RuntimeError("CAD section has faces but could not be tessellated")
+        triangles = [Polygon(triangle[:, uv]) for triangle in vertices[faces]]
+        polygons = [p for p in triangles if p.area > 1e-12]
+        if not polygons:
+            raise RuntimeError("CAD section has no measurable area")
+        region = unary_union(polygons)
+        if region.is_empty or not region.is_valid:
+            raise RuntimeError("CAD section produced an invalid planar region")
+        self._cache[key] = region
+        return region
+
+
 def _slice_region(mesh, axis, coord):
     """Filled 2D region (shapely geometry) of the cross-section at `coord` along
     `axis`, holes subtracted. None if the plane misses the mesh."""
+    if isinstance(mesh, CADSections):
+        return mesh.section_region(axis, coord)
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
     from .draw import _section_polys
@@ -426,10 +466,7 @@ def slice_occupancy(target_mesh, cand_mesh, *, axes=(0, 1, 2), n=40,
                 ca = float(cr.area) if cr is not None else 0.0
             # per-loop opening check (scale-free) — after band masking, so
             # recognized thread bands don't produce ring mismatches
-            try:
-                _match_rings(mr, cr, names[axis], float(c), ring_raw)
-            except Exception:  # noqa: BLE001
-                pass
+            _match_rings(mr, cr, names[axis], float(c), ring_raw)
             if mr is not None and cr is not None:
                 inter = mr.intersection(cr)
                 ia = float(inter.area)
@@ -751,6 +788,18 @@ def thread_bands(analysis: dict) -> list[dict]:
             td = f.get("threaded")
             if not td:
                 continue
+            measured = td.get('validation_band')
+            if measured is not None:
+                r = np.asarray(measured['r'], dtype=float)
+                t = np.asarray(measured['t'], dtype=float)
+                if (r.shape != (2,) or t.shape != (2,) or not np.all(np.isfinite([r,t]))
+                        or not 0 <= r[0] < r[1] or not t[0] < t[1]):
+                    raise ValueError('invalid measured thread validation band')
+                for pos in f.get('positions_mm', []):
+                    bands.append({'point': [float(x) for x in pos],
+                                  'axis': [float(x) for x in f['axis']],
+                                  't': t.tolist(), 'r': r.tolist(), 'label': td['spec']})
+                continue
             r0 = 0.5 * td["minor_diameter_mm"] - 0.4
             r1 = 0.5 * td["major_diameter_mm"] + 0.4
             depth = float(f.get("depth_mm", 0) or 0)
@@ -802,8 +851,8 @@ def candidate_features(shape) -> dict:
                 tor_r.append(float(ad.Torus().MinorRadius()))
             elif t == GeomAbs_Cone:
                 cone_a.append(abs(float(ad.Cone().SemiAngle())))
-        except Exception:  # noqa: BLE001 — a weird face must not crash the check
-            pass
+        except Exception as exc:
+            raise RuntimeError("cannot inspect candidate analytic face") from exc
         exp.Next()
     return {"cylinder_radii": cyl_r, "torus_minor_radii": tor_r,
             "cone_semi_angles": cone_a}
@@ -814,6 +863,70 @@ def _match_count(radii, target_r, rel=0.2, absol=0.3):
     absol mm, whichever is looser)."""
     tol = max(absol, rel * target_r)
     return int(sum(1 for r in radii if abs(r - target_r) <= tol))
+
+
+def _nominal_thread_matches(shape, feature, high):
+    """Exact nominal bore geometry must not be hidden by the relief mask.
+
+    Require a full concave analytic cylinder on the measured axis, at the
+    specified minor diameter, spanning both measured ring caps. Legacy feature
+    matching keeps its existing tolerances; this strengthens identified nominal
+    thread validation only.
+    """
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_VERTEX, TopAbs_REVERSED
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    axis = np.asarray(feature['axis'], dtype=float)
+    axis /= np.linalg.norm(axis)
+    high = np.asarray(high, dtype=float)
+    depth = float(feature['depth_mm'])
+    radius = .5*float(feature['threaded']['nominal_minor_diameter_mm'])
+    tolerance = max(1e-4, 1e-6*radius)
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = TopoDS.Face_s(explorer.Current())
+        surface = BRepAdaptor_Surface(face)
+        explorer.Next()
+        if surface.GetType() != GeomAbs_Cylinder:
+            continue
+        cylinder = surface.Cylinder()
+        direction = np.array(cylinder.Axis().Direction().Coord())
+        centre = np.array(cylinder.Location().Coord())
+        delta = centre-high
+        if (abs(cylinder.Radius()-radius) > tolerance
+                or abs(direction@axis) < 1-1e-8
+                or np.linalg.norm(delta-(delta@axis)*axis) > tolerance
+                or surface.LastUParameter()-surface.FirstUParameter() < 2*np.pi-1e-6):
+            continue
+        point, du, dv = gp_Pnt(), gp_Vec(), gp_Vec()
+        surface.D1(.5*(surface.FirstUParameter()+surface.LastUParameter()),
+                   .5*(surface.FirstVParameter()+surface.LastVParameter()),point,du,dv)
+        normal = np.array(du.Crossed(dv).Coord())
+        if face.Orientation() == TopAbs_REVERSED:
+            normal = -normal
+        radial = np.array(point.Coord())-centre
+        radial -= (radial@axis)*axis
+        if normal@radial >= 0:
+            continue
+        vertices = TopExp_Explorer(face, TopAbs_VERTEX)
+        axial = []
+        while vertices.More():
+            vertex = TopoDS.Vertex_s(vertices.Current())
+            axial.append(float((np.array(BRep_Tool.Pnt_s(vertex).Coord())-high)@axis))
+            vertices.Next()
+        if axial and abs(min(axial)+depth) <= tolerance and abs(max(axial)) <= tolerance:
+            properties = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(face, properties)
+            expected_area = 2*np.pi*radius*depth
+            if abs(properties.Mass()-expected_area) <= max(1e-4,1e-6*expected_area):
+                return True
+    return False
 
 
 def feature_gap(analysis: dict, shape) -> list[dict]:
@@ -827,21 +940,27 @@ def feature_gap(analysis: dict, shape) -> list[dict]:
 
     feats = (analysis or {}).get("features") or {}
     for h in feats.get("holes", []):
+        if h.get('threaded', {}).get('representation') == 'nominal_internal_minor':
+            positions = h.get('positions_mm', [])
+            if (len(positions) != int(h.get('count', 1))
+                    or not all(_nominal_thread_matches(shape, h, p) for p in positions)):
+                gaps.append({'kind': 'nominal_thread', 'detail': h['threaded']['spec'],
+                             'expected': int(h.get('count', 1)), 'found': 0,
+                             'note': 'nominal minor diameter, coaxial full bore and cap span required'})
         r = 0.5 * float(h.get("diameter_mm", 0))
         if r <= 0:
             continue
         want = int(h.get("count", 1))
-        # a counterbore hole contributes 2 cylinder faces per instance
+        stages = [(r, "hole")]
         if h.get("counterbore"):
-            want_faces = want * 2
-        else:
-            want_faces = want
-        found = _match_count(cand["cylinder_radii"], r)
-        if found < want_faces:
-            gaps.append({
-                "kind": "hole", "detail": f"Ø{2*r:.2f}mm x{want}",
-                "expected": want_faces, "found": found,
-                "note": "hole/bore not modelled as a cylindrical feature"})
+            stages.append((.5*float(h["counterbore"]["diameter_mm"]), "counterbore"))
+        for radius, stage in stages:
+            found = _match_count(cand["cylinder_radii"], radius)
+            if found < want:
+                gaps.append({
+                    "kind": "hole", "detail": f"{stage} Ø{2*radius:.2f}mm x{want}",
+                    "expected": want, "found": found,
+                    "note": f"{stage} not modelled as a cylindrical feature"})
 
     for b in feats.get("bosses", []):
         r = 0.5 * float(b.get("diameter_mm", 0))

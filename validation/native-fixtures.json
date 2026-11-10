@@ -1,0 +1,164 @@
+{
+  "description": "Validated geometry source snapshot; all gates executed. Full artifacts were generated under out/thread-auto-complete.",
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "unit_tests_passed": 73,
+  "dependencies_pass": true,
+  "geometry_source_sha256": {
+    "src/stlstep/__init__.py": "6b7ccd89b99e25e1de5ff3b9215f473a4f7c6342f74bf0b5a2a463a3749647d3",
+    "src/stlstep/_detector.py": "93accbca99cf56d90dc23b1884b9b951bad8369c34a59bcc27087a76476dfe44",
+    "src/stlstep/_mesh_repair.py": "7647c4f3ceb6288c2de8c6f7f5b1deab72f5e09f27e8a5ba669b13f6525faf6f",
+    "src/stlstep/compose.py": "d381e30c87f0640f656eea6de46b72ee3e8baba03b75e04953d2ec524a9025a0",
+    "src/stlstep/convert.py": "3b3052eb19eefba69f5af70b4b29f722d87a89933710a640f7f2ddf9c33254fc",
+    "src/stlstep/draw.py": "eec0765a7ad7871af151b282623c50a9324193ea0b0647c1e6b3dd3f549adc48",
+    "src/stlstep/edgeblock.py": "da985ca6fdbaf2e226c916fb9d9e839adf472eff94aa142c0dfa8c8c475cf42e",
+    "src/stlstep/edges.py": "cc54c015828ca75619a05e65e1cfb0cfc1b03f586569a064208218330e259687",
+    "src/stlstep/featurecheck.py": "f9f60f95d202594f2a542b78ac7196174671d7d6c23b26e3b8eca44fccb10d3a",
+    "src/stlstep/features.py": "4ab57dc180f1c98d2b5bcaf302d9d0eb740ba8f7d8dbee7b4eae2898b39650c0",
+    "src/stlstep/fit.py": "7b8e49dffa136aa72086f2e8a7c3de75b59a76447e3f0f60559eedf8bc70852c",
+    "src/stlstep/ingest.py": "47e53d54abc9abe554a1cb80596341d1e11dddd3d8de98dbd75f5acd1576b1ec",
+    "src/stlstep/machining.py": "a67b51248a64bd551b79a1aabd5c158761cb6cb0d83c60a9467c11e40d32f8d7",
+    "src/stlstep/nurbs.py": "d2e01d06f2cadd6642ec6d00377c4a199fe37e23e4d852cda96f66edfb6fc906",
+    "src/stlstep/occ_util.py": "7b362c65445653163ee2e6e7c6ec0e88b0238a339492d9898420950552cfd46b",
+    "src/stlstep/probe.py": "383f472fca72b880995ce73f247a4ba73d8b7c4717360f71a029f7f258a86aaf",
+    "src/stlstep/proximity.py": "f6d7235d6a3bdc00bb1085d2469f139faf19146aa55b3c5d7ff344d0537fffd6",
+    "src/stlstep/refinement.py": "f1a247f74cfc5ad4ab140d96d591e2352750430632ada33c338fa766a4a15779",
+    "src/stlstep/sections.py": "ca16a09fcacd5d331f564eaa3d6effc568187738114255e1980ed96e406d25b9",
+    "src/stlstep/segment.py": "e7ee17e1c40b637307d93642523fd26245686a8558ffb2f1c57815435efb0e1a",
+    "src/stlstep/segment_rg.py": "25cbd074d46f9d5ea1b029784cad3386051b5152162438fb43823311a7e76e0d",
+    "src/stlstep/surfaces.py": "e1c072c24d1f61420885a464df4e5220e9f3c6ba1b3e6e5ad5371ea20a4d3f4e",
+    "src/stlstep/threaded.py": "8e37a12070f2618c1543b1bb0f2a9d8facff8a84f449c51e69401a9d9301ebf9",
+    "src/stlstep/topology.py": "351cd93174fcdb6e3592a08b6b5c24575959d49357b50d76c5940aee203378a4",
+    "src/stlstep/verify.py": "9ad1423c13c2febc3ae0ce96e600cea289ccc07fef5447ca15d9fbd5e454c026",
+    "src/stlstep/voids.py": "d29e97c6b99be520a6f484ef1953fe5a8c93538eda3dbeffbbc01600bc612054"
+  },
+  "pipeline_sha256": "39b856a519e95249a98e03d66943cf42054f4c8e6e9d7b7bca47b37fbd24cc5d",
+  "cases": [
+    {
+      "fixture": "adapter",
+      "input_sha256": "e946919e9d1713cd4b72fad245d60ca940a47542dc4bf8102ba890ac3be3dcb6",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.040172567153720064,
+      "reverse_sampled_p99_mm": 0.03986642607730484,
+      "tolerance_mm": 0.1391,
+      "note": ""
+    },
+    {
+      "fixture": "battery_cover",
+      "input_sha256": "f51ae9f7a888a62b0564c1161580ab104dfbb0ef62f25b55138a94d5222385e2",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.013866286548283091,
+      "reverse_sampled_p99_mm": 0.015138300013557416,
+      "tolerance_mm": 0.21,
+      "note": ""
+    },
+    {
+      "fixture": "bearing",
+      "input_sha256": "94bf2dcd9e234bae6fdfd756e7903d8ae747324051a615eadf2c00e8349265d5",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.06650807912405166,
+      "reverse_sampled_p99_mm": 0.06795104420321758,
+      "tolerance_mm": 0.1,
+      "note": ""
+    },
+    {
+      "fixture": "bracket",
+      "input_sha256": "1080c6f385175d722a8b3ac47eccf68acb009a0ce7afd4564810205ec29717a3",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.021915465394698325,
+      "reverse_sampled_p99_mm": 0.02184401771282071,
+      "tolerance_mm": 0.1426,
+      "note": ""
+    },
+    {
+      "fixture": "channel",
+      "input_sha256": "463531c470915329c90c1980475a7a79445eeb62f098e6b7dcab17dd526cff8f",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 1.6983270567564614e-13,
+      "reverse_sampled_p99_mm": 1.9452117039988017e-13,
+      "tolerance_mm": 0.1677,
+      "note": ""
+    },
+    {
+      "fixture": "crossblock",
+      "input_sha256": "9c6980b764648a8733331a157cc65fbab9d36d8e7d717e04267c8cd335893f83",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.023001178231517705,
+      "reverse_sampled_p99_mm": 0.02294015190797642,
+      "tolerance_mm": 0.1061,
+      "note": ""
+    },
+    {
+      "fixture": "diff_case",
+      "input_sha256": "8bbc82c57268abc7100a8192e72022cbbb7ad78b9417d9476b6157e22a44f3d6",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.02455064138052544,
+      "reverse_sampled_p99_mm": 0.02464336233260296,
+      "tolerance_mm": 0.1,
+      "note": ""
+    },
+    {
+      "fixture": "filletblock",
+      "input_sha256": "b1fc143b4a3f60583228511638d0604df2547bbbc8ead90096852f2309c9480e",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.023606810041699653,
+      "reverse_sampled_p99_mm": 0.02360362221177358,
+      "tolerance_mm": 0.1006,
+      "note": ""
+    },
+    {
+      "fixture": "manifold",
+      "input_sha256": "528582f5b9adeb4f7e4a6befd401c39c23402c61b85ab0684c2dc313e05070ac",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.022741259630148794,
+      "reverse_sampled_p99_mm": 0.022741607525405782,
+      "tolerance_mm": 0.116,
+      "note": ""
+    },
+    {
+      "fixture": "shaft",
+      "input_sha256": "0c4eee6a3e053eaca6df456a7bc4ec13ce96999cf1e6741986cf51a6f44fb108",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.02374658783934649,
+      "reverse_sampled_p99_mm": 0.02374646086423991,
+      "tolerance_mm": 0.1,
+      "note": ""
+    },
+    {
+      "fixture": "sleeve",
+      "input_sha256": "2df398af3be3db581c225529f21d66db066042ce1f4cdf372766398183c4e06a",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.024474899365972885,
+      "reverse_sampled_p99_mm": 0.024387099089931932,
+      "tolerance_mm": 0.1,
+      "note": ""
+    },
+    {
+      "fixture": "threadring",
+      "input_sha256": "655336828a20a8d6dadda5d53adaeff2fea90a132af775c569feed6722f542cd",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.023776886949743694,
+      "reverse_sampled_p99_mm": 0.02371430157041457,
+      "tolerance_mm": 0.1,
+      "note": "Nominal M10x1.5; distance/occupancy outside measured thread relief band."
+    },
+    {
+      "fixture": "vslot",
+      "input_sha256": "b60d8f036c479de85a78ef91512d4b945e9759024440e00815da979b0789e331",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 0.011831566361412749,
+      "reverse_sampled_p99_mm": 0.011885795716340575,
+      "tolerance_mm": 0.1559,
+      "note": ""
+    },
+    {
+      "fixture": "ytower",
+      "input_sha256": "2e7159ed95f7470d4dc0750be1e0265010e400a1be1e5cac5b5c2ec0f5964b54",
+      "geometry_pass": true,
+      "forward_sampled_p99_mm": 4.264209240578113e-14,
+      "reverse_sampled_p99_mm": 3.938455384551974e-14,
+      "tolerance_mm": 0.1,
+      "note": ""
+    }
+  ]
+}

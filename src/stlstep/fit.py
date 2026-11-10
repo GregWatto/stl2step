@@ -15,6 +15,8 @@ cheap derivative-free pattern search.
 
 from __future__ import annotations
 
+from .proximity import closest_point
+
 import ast
 from dataclasses import dataclass
 
@@ -88,8 +90,8 @@ def _distances(part, mesh, pts_on_mesh):
     if len(rf) == 0:
         return None
     gen = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
-    _, fwd, _ = trimesh.proximity.closest_point(gen, pts_on_mesh)
-    _, rev, _ = trimesh.proximity.closest_point(mesh, np.asarray(rv))
+    _, fwd, _ = closest_point(gen, pts_on_mesh)
+    _, rev, _ = closest_point(mesh, np.asarray(rv))
     return np.asarray(fwd), np.asarray(rev)
 
 

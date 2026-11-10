@@ -17,6 +17,8 @@ average. This gate refuses that trap:
 
 from __future__ import annotations
 
+from .proximity import closest_point
+
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -50,7 +52,7 @@ class GateResult:
 
 def _proximity(target_mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
     """Unsigned nearest-surface distance from each point to target_mesh."""
-    _, dist, _ = trimesh.proximity.closest_point(target_mesh, points)
+    _, dist, _ = closest_point(target_mesh, points)
     return np.asarray(dist, dtype=float)
 
 

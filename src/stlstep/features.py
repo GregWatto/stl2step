@@ -58,7 +58,7 @@ def _pockets(mesh, seg, diag) -> list[dict]:
         n = _unit(fn[r.face_ids].mean(axis=0))       # OUTWARD (seg normals have arbitrary sign)
         pts = V[F[r.face_ids]].reshape(-1, 3)
         P.append({"n": n, "off": float(np.median(pts @ n)), "pts": pts,
-                  "cen": pts.mean(axis=0)})
+                  "ids": r.face_ids, "cen": pts.mean(axis=0)})
 
     out = []
     for fl in P:
@@ -109,7 +109,15 @@ def _pockets(mesh, seg, diag) -> list[dict]:
         # PLACEABLE (a size without a centre can't be emitted). e1,e2 span the floor; n is depth.
         cu, cv = 0.5 * (ub[0] + ub[1]), 0.5 * (vb[0] + vb[1])
         centre = cu * e1 + cv * e2 + f * n
+        from shapely.geometry import Polygon, box
+        from shapely.ops import unary_union
+        triangles = V[F[fl["ids"]]]
+        projected = np.stack([triangles@e1, triangles@e2], axis=-1)
+        floor_region = unary_union([Polygon(t) for t in projected])
+        rectangle = box(ub[0], vb[0], ub[1], vb[1])
+        rectangular = floor_region.symmetric_difference(rectangle).area <= .02*rectangle.length
         out.append({"opening_normal": [round(float(x), 3) for x in n],
+                    "profile_kind": "rectangle" if rectangular else "profiled",
                     "opening_level_mm": round(opening, 2),
                     "floor_level_mm": round(float(f), 2),
                     "depth_mm": round(depth, 2),
@@ -126,6 +134,19 @@ def _is_void(mesh, floor_pts, n, level) -> bool:
     material — the pocket void, vs a solid block or an open step read as solid.
     Cross-section + point-in-polygon over MANY floor points (a single centroid can
     fluke into a hole); robust to non-watertight meshes."""
+    if np.max(np.abs(n)) > 1-1e-6:
+        from shapely.geometry import Point
+        from .featurecheck import _slice_region
+        axis = int(np.argmax(np.abs(n)))
+        uv = [i for i in range(3) if i != axis]
+        region = _slice_region(mesh, axis, float(level/n[axis]))
+        if region is None:
+            return True
+        idx = np.linspace(0, len(floor_pts)-1, min(20,len(floor_pts))).astype(int)
+        samples = floor_pts[idx]
+        samples = samples.mean(axis=0)+.6*(samples-samples.mean(axis=0))
+        inside = sum(region.contains(Point(*point[uv])) for point in samples)
+        return inside < .5*len(samples)
     import trimesh
     from shapely.geometry import Point
     try:
@@ -146,10 +167,18 @@ def _is_void(mesh, floor_pts, n, level) -> bool:
 
 
 def group_features(mesh, seg, surfaces, bbox_size) -> dict:
+    # This recognizer verifies the entire plain ring, including helical phase.
+    # Its feature table and nominal proposal must carry identical evidence.
+    from .threaded import detect_threaded_ring
+    ring = detect_threaded_ring(mesh)
+    if ring is not None:
+        return ring.features()
     diag = float(np.linalg.norm(bbox_size))
     cyls = []
     for s in surfaces:
         if s["kind"] != "cylinder":
+            continue
+        if s.get("fit_support", {}).get("confident") is False:
             continue
         axis = _unit(s["axis"])
         cyls.append({"dia": float(s["diameter_mm"]), "axis": axis,
@@ -228,7 +257,9 @@ def group_features(mesh, seg, surfaces, bbox_size) -> dict:
         "bosses": _patternize(bosses),
         "pockets": pockets,
         "thread_candidates": _thread_candidates(micro, diag),
-        "low_confidence_fits": _degenerate(surfaces, diag),
+        "low_confidence_fits": _degenerate(surfaces, diag) + [
+            {**s, "note": "position-only cylinder fit rejected by face normals"}
+            for s in surfaces if s.get("fit_support", {}).get("confident") is False],
         "notes": ["round/oblique pockets and slots aren't grouped — read those "
                   "off the cross-sections and the plane list"] + saddle_notes,
     }
@@ -285,12 +316,21 @@ def _thread_candidates(micro: list[dict], diag: float) -> list[dict]:
 def _collapse_coaxial(cs, axis, mesh) -> dict:
     """One axis line's cylinders -> a hole/boss with counterbore stages."""
     stages_by_dia: dict = {}
+    intervals = {}
     for c in cs:
         d = round(c["dia"], 1)
         ta, tb = float(c["ea"] @ axis), float(c["eb"] @ axis)
         lo, hi = min(ta, tb), max(ta, tb)
+        intervals.setdefault(d, []).append((lo, hi))
         s = stages_by_dia.setdefault(d, [lo, hi])
         s[0], s[1] = min(s[0], lo), max(s[1], hi)
+    contiguous = True
+    for spans in intervals.values():
+        end = -np.inf
+        for lo, hi in sorted(spans):
+            if end != -np.inf and lo > end+.01:
+                contiguous = False
+            end = max(end, hi)
     stages = sorted(({"dia": d, "t0": t[0], "t1": t[1]}
                      for d, t in stages_by_dia.items()), key=lambda s: s["t0"])
     t_lo = min(s["t0"] for s in stages)
@@ -305,8 +345,14 @@ def _collapse_coaxial(cs, axis, mesh) -> dict:
             "_at": (foot + t_lo * axis, at)}          # (lo end, hi end) world pts
     if len(stages) >= 2:
         wide = max(stages, key=lambda s: s["dia"])
+        narrow = min(stages, key=lambda s: s['dia'])
+        contiguous = contiguous and max(narrow['t0'], wide['t0']) <= min(narrow['t1'], wide['t1'])+.01
         feat["counterbore"] = {"diameter_mm": round(wide["dia"], 3),
-                               "depth_mm": round(wide["t1"] - wide["t0"], 3)}
+                               "depth_mm": round(wide["t1"] - wide["t0"], 3),
+                               "end": ("high" if abs(wide["t1"]-t_hi)<.01 and wide["t0"]>t_lo+.01
+                                       else "low" if abs(wide["t0"]-t_lo)<.01 and wide["t1"]<t_hi-.01
+                                       else "ambiguous"),
+                               "stage_count": len(stages), "contiguous": bool(contiguous)}
     return feat
 
 
@@ -330,7 +376,8 @@ def _patternize(locs: list[dict]) -> list[dict]:
     groups: dict = {}
     for f in locs:
         sig = (tuple(f["axis"]), round(f["diameter_mm"], 1), f.get("through"),
-               round(f.get("counterbore", {}).get("diameter_mm", 0), 1))
+               round(f.get("counterbore", {}).get("diameter_mm", 0), 1),
+               f.get("depth_mm"), tuple(sorted(f.get("counterbore", {}).items())))
         groups.setdefault(sig, []).append(f)
 
     out = []
@@ -465,7 +512,9 @@ def thread_signature(mesh, axis_dir, axis_pt, *, t_range=None, r_hint=None,
         return None
     rw, tw = rb[wall], tb[wall]
     rad_w = radial[sel][wall]
-    th = np.arctan2(rad_w[:, 1], rad_w[:, 0])
+    e1 = np.eye(3)[int(np.argmin(abs(d)))]
+    e2 = np.cross(d, e1)
+    th = np.arctan2(rad_w @ e2, rad_w @ e1)
     # robust 10/90 percentiles: entry chamfers / an adjacent recess pollute
     # the tails and would fake a too-deep thread
     r_lo, r_hi = float(np.percentile(rw, 10)), float(np.percentile(rw, 90))
@@ -567,6 +616,16 @@ def thread_signature(mesh, axis_dir, axis_pt, *, t_range=None, r_hint=None,
 # features — arming the brief AND the feature gate.
 # ----------------------------------------------------------------------------
 
+def _circle_boundary_supported(points, cx, cy, radius):
+    """Check edges too: rectangle corners can lie on a perfect fitted circle."""
+    points = np.asarray(points, dtype=float)
+    midpoints = .5*(points[:-1] + points[1:])
+    if len(midpoints) == 0:
+        return False
+    errors = np.abs(np.linalg.norm(midpoints - [cx, cy], axis=1) - radius)
+    return bool(np.quantile(errors, .95) <= max(.02, .01*radius))
+
+
 def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
     from shapely.geometry import Polygon
     from .draw import _circle_fit_2d
@@ -605,6 +664,8 @@ def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
                             or abs(2 * r - max(w, h)) > 0.3 * max(w, h)
                             or abs(area - np.pi * r * r) > 0.2 * np.pi * r * r):
                         continue
+                    if not _circle_boundary_supported(pts, cx, cy, r):
+                        continue
                     cands.append({"axis": axis, "t": float(c),
                                   "cu": float(cx), "cv": float(cy),
                                   "r": float(r), "u": u, "v": v})
@@ -639,15 +700,16 @@ def _section_loop_holes(mesh, existing_holes, *, n=56) -> list[dict]:
     for hnew in holes:
         dup = False
         for h in existing_holes:
-            if abs(h["diameter_mm"] - hnew["diameter_mm"]) > 0.3 * max(
-                    h["diameter_mm"], hnew["diameter_mm"]):
+            diameters = [h["diameter_mm"], h.get("counterbore", {}).get("diameter_mm", 0)]
+            if not any(abs(d-hnew["diameter_mm"]) <= .15*max(d,hnew["diameter_mm"])
+                       for d in diameters if d > 0):
                 continue
-            if abs(float(np.dot(h["axis"], hnew["axis"]))) < 0.9:
+            axis = _unit(np.asarray(h["axis"], float))
+            if abs(float(np.dot(axis, hnew["axis"]))) < .99:
                 continue
             for p in h.get("positions_mm", []):
-                d = np.linalg.norm(np.asarray(p) - np.asarray(
-                    hnew["positions_mm"][0]))
-                if d < max(2.0, h["diameter_mm"]):
+                delta = np.asarray(p)-np.asarray(hnew["positions_mm"][0])
+                if np.linalg.norm(delta-np.dot(delta,axis)*axis) < .8:
                     dup = True
         if not dup:
             out.append(hnew)
@@ -850,6 +912,8 @@ def _open_bore_holes(mesh, existing_holes, diag, *, n=48) -> tuple[list, list]:
                     if r < 1.5 or r > 0.45 * diag or resid > 0.05 * r:
                         continue
                     a = arc[keep]
+                    if not _circle_boundary_supported(a, cx, cy, r):
+                        continue
                     span = float(np.degrees(np.ptp(np.unwrap(
                         np.sort(np.arctan2(a[:, 1] - cy, a[:, 0] - cx))))))
                     if span < 150 or chord > 1.4 * 2 * r:
@@ -910,15 +974,16 @@ def _open_bore_holes(mesh, existing_holes, diag, *, n=48) -> tuple[list, list]:
     for hnew in holes:
         dup = False
         for h in existing_holes:
-            if abs(h["diameter_mm"] - hnew["diameter_mm"]) > 0.3 * max(
-                    h["diameter_mm"], hnew["diameter_mm"]):
+            diameters = [h["diameter_mm"], h.get("counterbore", {}).get("diameter_mm", 0)]
+            if not any(abs(d-hnew["diameter_mm"]) <= .15*max(d,hnew["diameter_mm"])
+                       for d in diameters if d > 0):
                 continue
-            if abs(float(np.dot(h["axis"], hnew["axis"]))) < 0.9:
+            axis = _unit(np.asarray(h["axis"], float))
+            if abs(float(np.dot(axis, hnew["axis"]))) < .99:
                 continue
             for p in h.get("positions_mm", []):
-                d = np.linalg.norm(np.asarray(p) - np.asarray(
-                    hnew["positions_mm"][0]))
-                if d < max(2.0, h["diameter_mm"]):
+                delta = np.asarray(p)-np.asarray(hnew["positions_mm"][0])
+                if np.linalg.norm(delta-np.dot(delta,axis)*axis) < .8:
                     dup = True
         if not dup:
             out.append(hnew)

@@ -8,6 +8,7 @@ The deterministic recognizers, tried cheapest-first by `draw()`:
   - EXTRUSION   — constant cross-section along an axis (fit to lines + arcs).
   - REVOLVE     — a profile swept about an axis.
   - PRISMATIC   — a stack of constant-section slabs (base + boss + pocket + step).
+  - MACHINED    — rectangular stock plus measured bosses and cross-axis bores.
   - LOFT        — a cross-section that varies continuously along an axis between
                   flat end caps (square-to-round adapter, drafted/tapered body).
 Each extracts and fits the real profile(s), emits a build123d feature script, and
@@ -19,6 +20,8 @@ exact path when they apply.
 """
 
 from __future__ import annotations
+
+from .proximity import closest_point
 
 from dataclasses import dataclass
 
@@ -59,6 +62,24 @@ def draw(mesh, *, dev_tol=None):
         dev_tol = size_tol(mesh)
     built = []                 # every valid model built, for the best-effort return
 
+    # A nominal thread is a semantic representation, so its independently
+    # measured relief band must accompany both proposal scoring and the brief.
+    try:
+        from .threaded import detect_threaded_ring, draw_threaded_ring
+        threaded = detect_threaded_ring(mesh)
+        if threaded is not None:
+            part, script, summary = draw_threaded_ring(threaded)
+            summary['raw_sampled_p99_mm'] = _part_deviation(part, mesh)
+            summary['deviation_scope'] = 'outside measured thread relief band'
+            deviation = _part_deviation(part, mesh, exclude_bands=threaded.bands())
+            result = DrawResult('threaded_ring', part, script, summary, deviation)
+            built.append(result)
+            if deviation <= dev_tol:
+                result.exact = True
+                return result
+    except Exception:
+        pass  # uncertain identification must not produce an exclusion
+
     # Tier 1: single-feature recognizers.
     single = []
     for name, detect, build in (("extrude", detect_extrusion, draw_extrusion),
@@ -93,7 +114,52 @@ def draw(mesh, *, dev_tol=None):
             if dev <= dev_tol:
                 r.exact = True
                 return r
+            try:
+                from .refinement import refine_prismatic
+                refined = refine_prismatic(pr, mesh)
+                if refined is not None:
+                    part2, script2, summary2 = refined
+                    result = DrawResult("refined_stack", part2, script2, summary2,
+                                        _part_deviation(part2, mesh))
+                    built.append(result)
+                    if result.deviation <= dev_tol:
+                        result.exact = True
+                        return result
+            except Exception:
+                pass  # a failed refinement leaves other recognizers available
     except Exception:  # noqa: BLE001
+        pass
+
+    # Confident machining features can explain cross-axis bores that a stack
+    # of single-station profiles cannot. Keep the usual measured acceptance bar.
+    try:
+        from .machining import detect_machining, draw_machining
+        spec = detect_machining(mesh)
+        if spec is not None:
+            part, script, summary = draw_machining(spec)
+            result = DrawResult("machined", part, script, summary,
+                                _part_deviation(part, mesh))
+            built.append(result)
+            if result.deviation <= dev_tol:
+                result.exact = True
+                return result
+    except Exception:  # one proposal failing must not suppress the other paths
+        pass
+
+    # Rounded extrusions with a measured uniform end chamfer should retain
+    # actual fillet/chamfer operations instead of becoming spline loft walls.
+    try:
+        from .edgeblock import detect_edgeblock, draw_edgeblock
+        edge_spec = detect_edgeblock(mesh)
+        if edge_spec is not None:
+            part, script, summary = draw_edgeblock(edge_spec)
+            result = DrawResult("edgeblock", part, script, summary,
+                                _part_deviation(part, mesh))
+            built.append(result)
+            if result.deviation <= dev_tol:
+                result.exact = True
+                return result
+    except Exception:  # a failed proposal must leave the existing fallbacks available
         pass
 
     # Tier 3: lofted (continuously-varying cross-section).
@@ -323,6 +389,9 @@ def _section_polys(mesh, axis, coord):
     """Cross-section at `coord` along `axis` as a list of polygons, each
     (exterior (N,2), [interior (M,2), ...]) in world (u, v) coords. None if the
     plane misses the mesh."""
+    if not mesh.is_watertight:
+        from .sections import section_polygons
+        return section_polygons(mesh, axis, coord)
     normal = np.zeros(3); normal[axis] = 1.0
     origin = np.zeros(3); origin[axis] = coord
     sec = mesh.section(plane_origin=origin, plane_normal=normal)
@@ -377,7 +446,7 @@ def _rot_symmetric(mesh, axis, pt, angles, tol):
     for a in angles:
         R = trimesh.transformations.rotation_matrix(np.radians(a), axis, pt)
         rot = mesh.copy(); rot.apply_transform(R)
-        _, d, _ = trimesh.proximity.closest_point(rot, pts)
+        _, d, _ = closest_point(rot, pts)
         if float(d.max()) > tol:
             return False
     return True
@@ -413,13 +482,43 @@ def _extract_profile(mesh, axis, pt):
                       loop=loop)
 
 
+def _align_profile_lines(segs, *, distance_tol=.02, slope_tol=.001):
+    """Recover axial/radial lines perturbed within the profile fit resolution.
+
+    Shared vertices move together, so snapping a nearly vertical line to a
+    cylinder does not open its neighboring arcs or shoulders. Real tapers stay.
+    """
+    if not segs:
+        return segs
+    from dataclasses import replace
+    points = np.array([s.p0 for s in segs], dtype=float)
+    count = len(points)
+    for dim in (0, 1):
+        parents = list(range(count))
+        def root(i):
+            while parents[i] != i:
+                i = parents[i]
+            return i
+        for i, segment in enumerate(segs):
+            j = (i + 1) % count
+            delta = np.abs(points[j] - points[i])
+            if (segment.kind == "line" and delta[1-dim] > 1e-9
+                    and delta[dim] <= min(distance_tol, slope_tol*delta[1-dim])):
+                parents[root(i)] = root(j)
+        for group in {root(i) for i in range(count)}:
+            ids = [i for i in range(count) if root(i) == group]
+            points[ids, dim] = np.mean(points[ids, dim])
+    return [replace(s, p0=tuple(points[i]), p1=tuple(points[(i+1) % count]))
+            for i, s in enumerate(segs)]
+
+
 def draw_revolve(rev: Revolution, mesh=None, *, dev_tol=0.1):
     """Build a revolved parametric solid + feature-tree script from a profile."""
     from build123d import (BuildPart, BuildSketch, BuildLine, Plane, Axis,
                            Line, ThreePointArc, make_face, revolve)
     from OCP.gp import gp_Ax1, gp_Pnt, gp_Dir
 
-    segs = fit_loop(rev.loop, arcs=True)
+    segs = _align_profile_lines(fit_loop(rev.loop, arcs=True))
     if not segs:
         return None, None, None
 
@@ -442,7 +541,7 @@ def draw_revolve(rev: Revolution, mesh=None, *, dev_tol=0.1):
     part = build(segs)
     if mesh is not None and any(s.kind == "arc" for s in segs):
         if _part_deviation(part, mesh) > dev_tol:
-            segs2 = fit_loop(rev.loop, arcs=False)
+            segs2 = _align_profile_lines(fit_loop(rev.loop, arcs=False))
             part2 = build(segs2)
             if _part_deviation(part2, mesh) < _part_deviation(part, mesh):
                 segs, part = segs2, part2
@@ -504,11 +603,63 @@ def draw_prismatic(pr: Prismatic, mesh=None, *, dev_tol=0.1):
                 fitted, part = fitted2, part2
 
     script = _emit_prismatic_script(pr, fitted)
+    constraints = 0
+    if mesh is not None and _part_deviation(part, mesh) > dev_tol:
+        body = _projection_constraints(mesh)
+        if body:
+            try:
+                from .compose import exec_script
+                constrained = exec_script(script + "\n" + body)
+                if _part_deviation(constrained, mesh) < _part_deviation(part, mesh):
+                    part, script, constraints = constrained, script + "\n" + body, 3
+            except Exception:  # a proposal can fail; the original is retained
+                pass
     from collections import Counter
     kinds = Counter(s.kind for _, _, lvl in fitted for es, hs in lvl
                     for grp in [es, *hs] for s in grp)
     summary = dict(kinds); summary["levels"] = len(fitted)
+    if constraints:
+        summary["projection_constraints"] = constraints
     return part, script, summary
+
+
+def _projection_constraints(mesh):
+    """Editable extruded silhouettes that bound the target along all axes.
+
+    Orthogonal projections are unions of the actual mesh triangles, not bounding
+    rectangles or a convex hull. They preserve concavities and through-openings.
+    Intersecting a proposal with these envelopes removes unsupported material;
+    it cannot supply a missing feature, and all candidates still need the gates.
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    if len(mesh.faces) > 100000:
+        return None  # bound proposal-generation cost for large scans
+    lines = []
+    for axis in (2, 1, 0):
+        uv = [a for a in range(3) if a != axis]
+        polygons = [Polygon(triangle[:, uv]) for triangle in mesh.triangles]
+        projection = unary_union([p for p in polygons if p.area > 1e-10])
+        profiles = list(getattr(projection, "geoms", [projection]))
+        if not profiles or len(profiles) > 32:
+            return None
+        sign = _PSIGN[axis]
+        start = repr(float(sign*mesh.bounds[0, axis]))
+        length = repr(float(sign*mesh.extents[axis]))
+        lines += [f"    # measured projection envelope along {'xyz'[axis]}",
+                  f"    with BuildSketch(Plane.{_PLANE[axis]}.offset({start})):"]
+        for polygon in profiles:
+            outer = fit_loop(np.asarray(polygon.exterior.coords))
+            if not outer:
+                return None
+            lines += _emit_loop_lines(outer, "", 8)
+            for hole in polygon.interiors:
+                inner = fit_loop(np.asarray(hole.coords))
+                if not inner:
+                    return None
+                lines += _emit_loop_lines(inner, ", mode=Mode.SUBTRACT", 8)
+        lines.append(f"    extrude(amount={length}, mode=Mode.INTERSECT)")
+    return "\n".join(lines)
 
 
 def _fit_prismatic(pr, *, arcs):
@@ -559,12 +710,15 @@ def _emit_prismatic_script(pr, fitted):
          "with BuildPart() as part:"]
     for k, (lo, hi, lvl) in enumerate(fitted):
         L.append(f"    # level {k + 1}: {pl} offset {_fmt(lo)} -> {_fmt(hi)}")
-        L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(sg * lo)})):")
+        # Use shared full-precision endpoints, not independently rounded
+        # offsets and lengths: tiny gaps create extra solids/internal faces.
+        start, stop = repr(float(sg * lo)), repr(float(sg * hi))
+        L.append(f"    with BuildSketch(Plane.{pl}.offset({start})):")
         for j, (es, hs) in enumerate(lvl):
             for grp, suffix in [(es, "")] + [(h, ", mode=Mode.SUBTRACT")
                                              for h in hs]:
                 L.extend(_emit_loop_lines(grp, suffix, 8))
-        L.append(f"    extrude(amount={_fmt(sg * (hi - lo))})")
+        L.append(f"    extrude(amount=({stop} - {start}))")
     return "\n".join(L)
 
 
@@ -641,7 +795,7 @@ def detect_lofted(mesh, *, n_stations=8, vary_tol=0.03, cap_frac=0.02,
     return None
 
 
-def _fit_lofted(spec, *, arcs):
+def _fit_lofted(spec, *, arcs, mesh=None):
     """Fit each station's exterior (+ a single through-hole if present at every
     station) into line/arc/circle segments. Returns (outer, holes) or None."""
     outer, holes, all_have_hole = [], [], True
@@ -657,7 +811,42 @@ def _fit_lofted(spec, *, arcs):
             all_have_hole = False
     if not (all_have_hole and holes and all(h for _, h in holes)):
         holes = None
+    if mesh is not None and holes:
+        holes = _measured_loft_bore(spec, holes, mesh)
     return outer, holes
+
+
+def _measured_loft_bore(spec, holes, mesh):
+    """Resolve section chord noise using an actual constant-radius vertex wall.
+
+    This does not widen the constancy test: original wall vertices must support
+    one circle within 1e-4 mm over the entire sampled axial span. A taper, thread,
+    offset bore or incomplete wall retains the general loft representation.
+    """
+    if any(len(h)!=1 or h[0].kind!='circle' for _,h in holes):
+        return holes
+    centres = np.array([h[0].center for _,h in holes])
+    if np.max(np.linalg.norm(centres-centres.mean(0),axis=1)) > 1e-4:
+        return holes
+    radius = float(np.median([h[0].radius for _,h in holes]))
+    uv = [a for a in range(3) if a != spec.axis]
+    vertices = np.asarray(mesh.vertices)
+    lo, hi = min(t for t,_ in holes), max(t for t,_ in holes)
+    radial = np.linalg.norm(vertices[:,uv]-centres.mean(0),axis=1)
+    selected = ((abs(radial-radius)<max(.02,.02*radius))
+                & (vertices[:,spec.axis]>=lo-1e-4)
+                & (vertices[:,spec.axis]<=hi+1e-4))
+    wall = vertices[selected]
+    if len(wall)<16 or np.ptp(wall[:,spec.axis]) < .99*(hi-lo):
+        return holes
+    fit = _circle_fit_2d(wall[:,uv])
+    if fit is None or not _spans_circle(wall[:,uv],fit):
+        return holes
+    errors = abs(np.linalg.norm(wall[:,uv]-fit[:2],axis=1)-fit[2])
+    if np.max(errors)>1e-4:
+        return holes
+    return [(t,[Seg('circle',h[0].p0,h[0].p1,center=(fit[0],fit[1]),radius=fit[2])])
+            for t,h in holes]
 
 
 def draw_lofted(spec: Lofted, mesh=None, *, dev_tol=0.1):
@@ -673,7 +862,7 @@ def draw_lofted(spec: Lofted, mesh=None, *, dev_tol=0.1):
     idx_options = [list(range(n)), [0, n - 1]]
     best = None                        # (dev, part, fitted, idx)
     for arcs in (True, False):
-        fitted = _fit_lofted(spec, arcs=arcs)
+        fitted = _fit_lofted(spec, arcs=arcs, mesh=mesh)
         if fitted is None:
             continue
         for idx in idx_options:
@@ -696,8 +885,24 @@ def draw_lofted(spec: Lofted, mesh=None, *, dev_tol=0.1):
     return part, script, summary
 
 
+def _constant_loft_hole(holes, idx):
+    """A coaxial, constant circular bore should remain an analytic cylinder.
+
+    The tiny absolute comparison absorbs profile fitting noise, not intentional
+    taper. Varying or noncircular sections retain the general loft path.
+    """
+    if not holes:
+        return False
+    sections = [holes[i][1] for i in idx]
+    if any(len(s) != 1 or s[0].kind != "circle" for s in sections):
+        return False
+    first = sections[0][0]
+    return all(np.allclose(s[0].center, first.center, atol=1e-4, rtol=0)
+               and abs(s[0].radius - first.radius) <= 1e-4 for s in sections)
+
+
 def _build_lofted(spec, fitted, idx):
-    from build123d import (BuildPart, BuildSketch, Plane, Mode, loft)
+    from build123d import (BuildPart, BuildSketch, Plane, Mode, loft, extrude)
     outer, holes = fitted
     base = getattr(Plane, _PLANE[spec.axis])
     sg = _PSIGN[spec.axis]
@@ -709,11 +914,16 @@ def _build_lofted(spec, fitted, idx):
                     _sketch_loop(es, Mode.ADD)
             loft()
             if holes:
-                for i in idx:
+                constant = _constant_loft_hole(holes, idx)
+                for i in (idx[:1] if constant else idx):
                     coord, hs = holes[i]
                     with BuildSketch(base.offset(sg * coord)):
                         _sketch_loop(hs, Mode.ADD)
-                loft(mode=Mode.SUBTRACT)
+                if constant:
+                    extrude(amount=sg * (holes[idx[-1]][0] - holes[idx[0]][0]),
+                            mode=Mode.SUBTRACT)
+                else:
+                    loft(mode=Mode.SUBTRACT)
         return part.part
     except Exception:  # noqa: BLE001
         return None
@@ -732,12 +942,18 @@ def _emit_lofted_script(spec, fitted, idx):
         L.extend(_emit_loop_lines(es, "", 8))
     L.append("    loft()")
     if holes:
-        L.append("    # through-hole lofted and subtracted")
-        for i in idx:
+        constant = _constant_loft_hole(holes, idx)
+        L.append("    # analytic cylindrical bore" if constant else
+                 "    # varying through-hole lofted and subtracted")
+        for i in (idx[:1] if constant else idx):
             coord, hs = holes[i]
             L.append(f"    with BuildSketch(Plane.{pl}.offset({_fmt(sg * coord)})):")
             L.extend(_emit_loop_lines(hs, "", 8))
-        L.append("    loft(mode=Mode.SUBTRACT)")
+        if constant:
+            length = sg * (holes[idx[-1]][0] - holes[idx[0]][0])
+            L.append(f"    extrude(amount={_fmt(length)}, mode=Mode.SUBTRACT)")
+        else:
+            L.append("    loft(mode=Mode.SUBTRACT)")
     return "\n".join(L)
 
 
@@ -772,7 +988,13 @@ def fit_loop(pts, *, arcs=True, corner_deg=18.0, arc_min_pts=4, line_tol=0.02,
 
     # full circle: closed smooth curve with no big angular gap about its centre
     cfit = _circle_fit_2d(P)
-    if cfit is not None and cfit[3] < 0.05 * cfit[2] and _spans_circle(P, cfit):
+    # Vertices alone can put an octagon (or square) on a plausible circle.
+    # Measure the complete boundary, including every edge midpoint.
+    circle_points = np.vstack([P, .5*(P+np.roll(P,-1,axis=0))])
+    circle_error = (np.max(abs(np.linalg.norm(circle_points-cfit[:2],axis=1)-cfit[2]))
+                    if cfit is not None else np.inf)
+    if (cfit is not None and circle_error <= max(line_tol, .002*cfit[2])
+            and _spans_circle(P, cfit)):
         return [Seg("circle", tuple(P[0]), tuple(P[0]),
                     center=(cfit[0], cfit[1]), radius=cfit[2])]
 
@@ -811,45 +1033,44 @@ def _polyline_segs(pts):
 
 def _curvature_fit(run, arc_min_pts, line_tol, arc_resid_frac, arcs,
                    curve_deg=4.0):
-    """Split an inter-corner run into lines and arcs by turning rate. A straight
-    edge turns ~0 per vertex; a smooth arc turns by a small, consistent amount.
+    """Fit by geometric error, rather than the mesh's per-facet turn angle.
 
-    Group by *curved vertices* (not edges): an arc spans the maximal run of
-    turning vertices, so its endpoints are the tangent junction points and the
-    circle fit uses only on-arc points — a flanking straight point can't pull the
-    radius. Straight stretches between arcs become single lines that share those
-    junction points."""
+    Fine tessellations have small turns even on a real curve. Recursive splitting
+    keeps every line within line_tol of its source points and accepts an arc only
+    when all its points support one circle. No curve is silently replaced by a
+    long chord just because adjacent facets turn by less than curve_deg.
+    """
     run = np.asarray(run, dtype=float)
-    m = len(run)
-    if m < 3:
+    if len(run) < 2:
+        return []
+    chord = run[-1] - run[0]
+    length = float(np.linalg.norm(chord))
+    if length > 1e-12:
+        t = np.clip((run - run[0]) @ chord / length**2, 0, 1)
+        distances = np.linalg.norm(run - (run[0] + t[:, None] * chord), axis=1)
+    else:
+        distances = np.linalg.norm(run - run[0], axis=1)
+    split = int(np.argmax(distances))
+    if float(distances[split]) <= line_tol:
         return [Seg("line", tuple(run[0]), tuple(run[-1]))]
-    d = run[1:] - run[:-1]
-    ang = np.arctan2(d[:, 1], d[:, 0])
-    turn = np.abs(_wrap(np.diff(ang)))                 # turning at vertices 1..m-2
-    vc = np.zeros(m, dtype=bool)
-    vc[1:m - 1] = turn >= np.radians(curve_deg)        # curved vertices
-
-    segs = []
-    prev = 0                                            # index up to which emitted
-    v = 1
-    while v < m - 1:
-        if not vc[v]:
-            v += 1
-            continue
-        s = v
-        while v < m - 1 and vc[v]:
-            v += 1
-        t = v - 1                                       # last curved vertex
-        if s > prev:                                    # straight lead-in
-            segs.append(Seg("line", tuple(run[prev]), tuple(run[s])))
-        grp = run[s:t + 1]
-        seg = (_fit_arc_group(grp, line_tol, arc_resid_frac)
-               if arcs and len(grp) >= arc_min_pts else None)
-        segs.extend([seg] if seg else _polyline_segs(grp))
-        prev = t
-    if prev < m - 1:                                    # straight tail
-        segs.append(Seg("line", tuple(run[prev]), tuple(run[m - 1])))
-    return segs
+    if arcs and len(run) >= arc_min_pts:
+        fit = _circle_fit_2d(run)
+        if fit is not None:
+            cx, cy, radius, _ = fit
+            errors = np.abs(np.linalg.norm(run - [cx, cy], axis=1) - radius)
+            angles = np.unwrap(np.arctan2(run[:, 1] - cy, run[:, 0] - cx))
+            steps = np.diff(angles)
+            monotone = np.all(steps >= -1e-6) or np.all(steps <= 1e-6)
+            if (radius < 1e4 and monotone and np.max(errors) <= line_tol
+                    and np.max(errors) <= arc_resid_frac * radius
+                    and abs(angles[-1] - angles[0]) < 2*np.pi - 1e-4):
+                return [Seg("arc", tuple(run[0]), tuple(run[-1]),
+                            center=(cx, cy), radius=radius,
+                            mid=tuple(run[len(run)//2]))]
+    if split == 0 or split == len(run) - 1:
+        split = len(run)//2
+    return (_curvature_fit(run[:split+1], arc_min_pts, line_tol, arc_resid_frac, arcs)
+            + _curvature_fit(run[split:], arc_min_pts, line_tol, arc_resid_frac, arcs))
 
 
 def _fit_arc_group(grp, line_tol, arc_resid_frac):
@@ -919,17 +1140,25 @@ def _has_arcs(loops):
     return any(s.kind == "arc" for loop in loops for s in loop)
 
 
-def _part_deviation(part, mesh):
-    """Max distance from mesh sample points to the built part's surface."""
+def _part_deviation(part, mesh, *, exclude_bands=None):
+    """Worst of both sampled p99 surface distances (mesh ↔ candidate)."""
     from . import occ_util as ou
     import trimesh
-    rv, rf = ou.shape_to_mesh(part.wrapped, 0.1)
+    rv, rf = ou.shape_to_mesh(part.wrapped, .05 if exclude_bands else .1)
     if len(rf) == 0:
         return float("inf")
     gm = trimesh.Trimesh(vertices=rv, faces=rf, process=False)
     pts, _ = trimesh.sample.sample_surface(mesh, 20000)
-    _, d, _ = trimesh.proximity.closest_point(gm, np.asarray(pts))
-    return float(np.quantile(d, 0.99))
+    reverse_points, _ = trimesh.sample.sample_surface(gm, 20000)
+    if exclude_bands:
+        from .featurecheck import mask_points_in_bands
+        pts = pts[mask_points_in_bands(pts, exclude_bands)]
+        reverse_points = reverse_points[mask_points_in_bands(reverse_points, exclude_bands)]
+        if min(len(pts), len(reverse_points)) < 100:
+            raise ValueError('insufficient non-thread samples for proposal validation')
+    _, d, _ = closest_point(gm, np.asarray(pts))
+    _, reverse, _ = closest_point(mesh, reverse_points)
+    return float(max(np.quantile(d, .99), np.quantile(reverse, .99)))
 
 
 def _build_part(ext, loops):

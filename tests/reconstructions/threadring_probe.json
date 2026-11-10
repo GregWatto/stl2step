@@ -1,0 +1,18 @@
+{
+  "axis": "z",
+  "center": [
+    0.0,
+    0.0
+  ],
+  "signature": {
+    "minor_diameter_mm": 8.539,
+    "major_diameter_mm": 9.837,
+    "pitch_mm": 1.452,
+    "depth_mm": 0.649,
+    "taper_deg": 0.0,
+    "internal": true,
+    "spec": "M10",
+    "spec_major_mm": 10.0,
+    "spec_pitch_mm": 1.5
+  }
+}

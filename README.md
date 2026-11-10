@@ -68,7 +68,7 @@ shipped wrong without it:
 | Gate | Catches | Why the others miss it |
 |---|---|---|
 | Valid, closed solid | broken booleans, open shells | — |
-| Deviation ≤ 0.1% of bbox diagonal (both directions) | dimensional error, scaled to the part | a fixed mm bar is too slack for small parts |
+| Sampled p99 deviation ≤ max(0.10 mm, 0.15% of bbox diagonal), both directions | dimensional error, scaled to the part | a fixed mm bar is too slack for small parts |
 | Feature completeness | detected holes/bosses/fillets not modelled as *editable ops* | a missing fillet barely moves any distance metric |
 | Slice occupancy (IoU on all 3 axes) | internal cavities filled solid, dropped pockets, oversize bodies | surface distance can't see whether *space* is solid |
 | Per-loop opening shapes (scale-free) | a Ø4 hole modelled as a square (IoU 0.76), a trapezoid port as its bounding box (boundary check) | p99 quantiles and %-volume floors dilute with part size |
@@ -140,6 +140,8 @@ Deterministic recognizers (no agent, seconds):
 | open U-channel (thin-walled) | prismatic | 0.000 mm |
 | square-to-round adapter + bore | loft | 0.089 mm |
 | battery cover, bracket, multi-level plates | prismatic | PASS |
+| crossblock (boss + mounting holes + cross-axis bore) | machined | 0.023 mm |
+| filletblock (rounded corners + top chamfer + bore) | edgeblock | 0.024 mm |
 
 On a 4,400-part CAD corpus, roughly a third of parts convert deterministically
 at < 0.1 mm. The rest route to the agent loop.
@@ -171,8 +173,12 @@ Agent-in-the-loop (real parts):
 src/stlstep/
   convert.py       CLI + escalation driver (recognize → compose → BREP)
   draw.py          deterministic recognizers + profile fitting + code emission
+  machining.py     measured stock, bosses, bores, counterbores, rectangular pockets
+  threaded.py      identified single-start ISO ring threads + nominal bore evidence
+  edgeblock.py     measured longitudinal fillets + uniform end chamfer + bores
   compose.py       brief / run / fit / compare / slices  (the agent loop)
   probe.py         the measurement toolbox (read-only, allow-listable)
+  sections.py      oriented mesh sections that preserve tangent openings
   featurecheck.py  the gate stack (tolerance, features, occupancy, loops)
   voids.py         internal-cavity analysis + atlas
   features.py      feature grouping, thread signature, section-loop holes
@@ -186,3 +192,27 @@ eval/run_corpus.py         corpus scoring harness
 ## License
 
 [Apache 2.0](LICENSE)
+
+## Codex and reproducible checks
+
+Codex uses [AGENTS.md](AGENTS.md) and the adapted
+[reconstruction skill](.agents/skills/stl-reconstruct/SKILL.md) to compose feature
+scripts in the current session, using the same deterministic geometry tools.
+Run `./scripts/test.sh` for unit regressions and a checked end-to-end smoke suite.
+See [reconstruction improvements](tests/IMPROVEMENTS.md) for validation fixes,
+analytic bores, and the refined battery-cover recipe. See [TESTING.md](TESTING.md)
+for the pinned environment, full fixture inventory,
+Codex-authored candidate validation, geometric gates, and retained artifacts.
+
+Automatic rectangular pockets and counterbores, with manifold validation and
+section-boundary safeguards, are documented in [MANIFOLD.md](tests/MANIFOLD.md).
+
+Measured circular tapers and stationary residual cuts now refine difficult slab
+models. See [remaining-case results](tests/REMAINING.md) for automatic diff_case
+reconstruction and the verified nominal M10×1.5 threadring recipe.
+
+Automatic nominal internal threads in plain cylindrical rings now use independent
+pitch/specification and whole-wall helical-phase evidence. See
+[automatic thread reconstruction](tests/THREADS.md) for scope and validation.
+
+For a reusable Codex cloud setup, see [CLOUD_ENVIRONMENT.md](CLOUD_ENVIRONMENT.md).
